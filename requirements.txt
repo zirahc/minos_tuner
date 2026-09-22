@@ -1,0 +1,3 @@
+# Tuner server only. Do not install on the GATK scoring machine.
+optuna>=4.0.0
+python-dotenv>=1.0.0

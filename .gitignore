@@ -1,0 +1,8 @@
+.env
+.env.tuner
+optuna.db
+*.db
+search_box.json
+__pycache__/
+.venv/
+venv/
