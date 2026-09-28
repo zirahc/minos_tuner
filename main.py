@@ -294,6 +294,8 @@ def stage_practice_rounds(practice: Path, stage: Path, limit: int) -> int:
 def _is_round_folder(folder: Path) -> bool:
     if not folder.is_dir() or folder.name.startswith("."):
         return False
+    if folder.name == "round_2aeeddc1d86288f3":
+        return False
     bam = list(folder.glob("*.bam"))
     truth = list(folder.glob("truth*.vcf*")) or list(folder.glob("*truth*.vcf*"))
     mutations = list(folder.glob("mutations*.vcf*")) or list(folder.glob("*mut*.vcf*"))

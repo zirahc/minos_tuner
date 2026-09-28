@@ -42,6 +42,7 @@ from utils.scoring import (
 )
 
 PRACTICE_DIR = REPO_ROOT / "datasets" / "practice"
+SKIP_ROUNDS = frozenset({"round_2aeeddc1d86288f3"})
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "gatk.conf"
 SAMTOOLS_IMAGE = "quay.io/biocontainers/samtools:1.20--h50ea8bc_0"
 REGION_PADDING = 100_000
@@ -311,6 +312,9 @@ def _list_round_folders(practice_dir: Path) -> Tuple[Optional[List[Path]], List[
     skipped: List[str] = []
     for child in sorted(practice_dir.iterdir()):
         if not child.is_dir() or child.name.startswith("."):
+            continue
+        if child.name in SKIP_ROUNDS:
+            print(f"  Skipping round {child.name}", flush=True)
             continue
         files = _discover_files(child)
         if files.get("error"):
