@@ -33,6 +33,9 @@ def insert_pending_config(
     box: Dict[str, Any],
     trial_number: int,
     gatk_config: Optional[Dict[str, Any]] = None,
+    worker_id: Optional[str] = None,
+    batch_id: Optional[str] = None,
+    rounds_target: Optional[int] = None,
 ) -> Optional[str]:
     row = {
         "experiment": experiment,
@@ -46,19 +49,90 @@ def insert_pending_config(
         "optuna_trial_number": trial_number,
         "status": "pending",
     }
+    if worker_id:
+        row["worker_id"] = str(worker_id)
+    if batch_id:
+        row["batch_id"] = str(batch_id)
+    if rounds_target is not None:
+        row["rounds_target"] = int(rounds_target)
     inserted = rest_json("POST", config_table(), body=row)
     return _row_id(inserted)
 
 
 def list_pending(limit: int = 1) -> List[Dict[str, Any]]:
+    """Unassigned pending rows. Fleet jobs carry a worker_id and are left for main.py."""
     query = "&".join([
         "select=*",
         "status=eq.pending",
+        "worker_id=is.null",
         "order=created_at.asc",
         f"limit={int(limit)}",
     ])
     data = rest_json("GET", config_table(), query=query)
     return data if isinstance(data, list) else []
+
+
+def list_jobs_for_workers(
+    worker_ids: List[str], statuses: List[str]
+) -> Optional[List[Dict[str, Any]]]:
+    if not worker_ids or not statuses:
+        return []
+    workers = ",".join(urllib.parse.quote(str(w), safe="") for w in worker_ids)
+    states = ",".join(urllib.parse.quote(str(s), safe="") for s in statuses)
+    query = "&".join([
+        "select=*",
+        f"worker_id=in.({workers})",
+        f"status=in.({states})",
+        "order=created_at.asc",
+    ])
+    data = rest_json("GET", config_table(), query=query)
+    if data is None:
+        return None
+    return data if isinstance(data, list) else []
+
+
+def claim_worker_job(worker_id: str) -> Optional[Dict[str, Any]]:
+    """Take the oldest pending row for this VPS. Empty when another claim won."""
+    worker = urllib.parse.quote(str(worker_id), safe="")
+    query = "&".join([
+        "select=*",
+        "status=eq.pending",
+        f"worker_id=eq.{worker}",
+        "order=created_at.asc",
+        "limit=1",
+    ])
+    data = rest_json("GET", config_table(), query=query)
+    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+        return None
+    config_id = str(data[0].get("id") or "")
+    if not config_id:
+        return None
+    claimed = rest_json(
+        "PATCH",
+        config_table(),
+        query="&".join([
+            f"id=eq.{urllib.parse.quote(config_id, safe='')}",
+            "status=eq.pending",
+        ]),
+        body={"status": "running"},
+    )
+    if isinstance(claimed, list) and claimed and isinstance(claimed[0], dict):
+        return claimed[0]
+    return None
+
+
+def config_for_trial(study_name: str, trial_number: int) -> Optional[Dict[str, Any]]:
+    query = "&".join([
+        "select=*",
+        f"study_name=eq.{urllib.parse.quote(study_name, safe='')}",
+        f"optuna_trial_number=eq.{int(trial_number)}",
+        "order=created_at.desc",
+        "limit=1",
+    ])
+    data = rest_json("GET", config_table(), query=query)
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return data[0]
+    return None
 
 
 def patch_config(config_id: str, fields: Dict[str, Any]) -> bool:

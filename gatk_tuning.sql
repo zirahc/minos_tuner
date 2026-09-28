@@ -81,6 +81,10 @@ alter table public.gatk_configs add column if not exists hypothesis text;
 alter table public.gatk_configs add column if not exists parent_config_id uuid;
 alter table public.gatk_configs add column if not exists optuna_trial_number integer;
 alter table public.gatk_configs add column if not exists status text;
+alter table public.gatk_configs add column if not exists worker_id text;
+alter table public.gatk_configs add column if not exists batch_id uuid;
+alter table public.gatk_configs add column if not exists rounds_target integer;
+alter table public.gatk_configs add column if not exists rounds_done integer;
 
 create index if not exists gatk_evaluations_config_id_idx
   on public.gatk_evaluations (config_id);
@@ -92,6 +96,8 @@ create index if not exists gatk_configs_category_idx
   on public.gatk_configs (search_category);
 create index if not exists gatk_configs_study_idx
   on public.gatk_configs (study_name);
+create index if not exists gatk_configs_worker_status_idx
+  on public.gatk_configs (worker_id, status);
 
 -- One row per config: the number Optuna should maximize.
 create or replace view public.gatk_config_scores as
@@ -118,7 +124,11 @@ select
   avg(e.fp_per_target) filter (where e.ok) as avg_fp_per_target,
   avg(e.f1_snp) filter (where e.ok) as avg_f1_snp,
   avg(e.f1_indel) filter (where e.ok) as avg_f1_indel,
-  avg(e.region_fp_total) filter (where e.ok) as avg_region_fp_total
+  avg(e.region_fp_total) filter (where e.ok) as avg_region_fp_total,
+  c.worker_id,
+  c.batch_id,
+  c.rounds_target,
+  c.rounds_done
 from public.gatk_configs c
 left join public.gatk_evaluations e on e.config_id = c.id
 group by c.id;

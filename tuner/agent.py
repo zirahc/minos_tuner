@@ -2,7 +2,12 @@
 
 Tuner server only. Does not run GATK or edit minos_subnet.
 
+Default is a multi-step agent: diagnose the limiter, review whether the
+last category is still moving, choose the next category, tighten bounds
+around the best trials. With an API key, a last step may revise that draft.
+
   python -m tuner.agent
+  python -m tuner.agent --no-review
   python -m tuner.agent --heuristic
 """
 from __future__ import annotations
@@ -29,7 +34,9 @@ except ImportError:
 
 from tuner.search_box import space_catalog, specs_to_space_json, validate_search_box, write_search_box
 from tuner.spaces import space_for
+from tuner.steps import multistep_search_box
 from tuner.supabase_scores import fetch_config_scores
+from tuner.v2_score import V2_BRIEF
 
 DEFAULT_OUT = TUNER_ROOT / "search_box.json"
 HISTORY_LIMIT = 40
@@ -39,19 +46,14 @@ SYSTEM_PROMPT = """You are a Minos subnet 107 GATK practice-tuning analyst.
 You propose ONE search box for Optuna. You do not invent GATK flags.
 You do not tune a live miner. You only choose a category and bounds.
 
-v2 ranking number is avg_combined_final:
-  combined_final = 0.70 * core + 0.30 * exp(-fp_per_target / 8)
-SNP/INDEL F1 (snp_final, weighted_f1) is diagnostic, not the objective.
+{v2}
 
 Rules:
-- Optimize avg_combined_final.
+- Optimize avg_combined_final by attacking the largest v2 point loss.
 - Open exactly one search_category from the catalog.
 - space keys must be a subset of that category. Do not add other GATK keys.
 - Bounds must stay inside the catalog low/high (or choices).
 - n_trials is 4..8.
-- If target F1 is already high and fp_per_target is high, open quality_filters
-  (calling confidence / mapping quality), not heterozygosity priors.
-- If INDEL F1 lags SNP F1, consider pcr or assembly, not SNP quality alone.
 - One category per round.
 - Failed / missing scores are not a GATK failure; ignore them for ranking.
 - Write a short hypothesis that a later review can confirm or reject.
@@ -60,7 +62,23 @@ Return ONLY a JSON object with keys:
   search_category, hypothesis, space, constraints, n_trials, optimize
 optimize must be "avg_combined_final".
 constraints may include min_avg_f1_snp, min_avg_f1_indel, min_avg_combined_final.
-"""
+""".format(v2=V2_BRIEF.strip())
+
+REVIEW_PROMPT = """You revise ONE Optuna search box for Minos GATK practice tuning.
+
+{v2}
+
+You are given a diagnosis and a draft box already chosen by a fixed 4-step policy:
+diagnose which v2 component leaves the most points on the table, review the last
+category, choose the next category, tighten bounds around the best trials.
+
+Keep the draft unless the diagnosis shows a clear mistake.
+You may change search_category, space bounds, n_trials (4..8), hypothesis, or constraints.
+Stay inside the catalog. Do not add GATK keys. optimize must stay "avg_combined_final".
+
+Return ONLY a JSON object with keys:
+  search_category, hypothesis, space, constraints, n_trials, optimize
+""".format(v2=V2_BRIEF.strip())
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -72,28 +90,43 @@ def main(argv: Optional[List[str]] = None) -> int:
     history = _compact_history(rows)
     print(f"   history rows for agent: {len(history)}", flush=True)
 
-    if args.heuristic or not _has_llm_key():
-        if not args.heuristic and not _has_llm_key():
-            print(
-                "   no ANTHROPIC_API_KEY or OPENAI_API_KEY — using heuristic box. "
-                "Do not paste keys here.",
-                flush=True,
-            )
+    if args.heuristic:
         try:
-            box = heuristic_search_box(history)
-            box = validate_search_box(box)
+            box = validate_search_box(heuristic_search_box(history))
         except ValueError as e:
             print(f"ERROR: heuristic box invalid: {e}", flush=True)
             return 2
         source = "heuristic"
-    else:
+    elif args.once:
+        if not _has_llm_key():
+            print("ERROR: --once needs ANTHROPIC_API_KEY or OPENAI_API_KEY.", flush=True)
+            return 2
         try:
-            raw = _llm_search_box(history)
-            box = validate_search_box(raw)
+            box = validate_search_box(_llm_search_box(history))
         except (ValueError, RuntimeError) as e:
             print(f"ERROR: LLM search box rejected: {e}", flush=True)
             return 2
         source = "llm"
+    else:
+        try:
+            draft, report = multistep_search_box(history)
+            box = validate_search_box(draft)
+        except ValueError as e:
+            print(f"ERROR: multi-step box invalid: {e}", flush=True)
+            return 2
+        _print_report(report)
+        source = "steps"
+        if _has_llm_key() and not args.no_review:
+            try:
+                revised = validate_search_box(_llm_review(report, box))
+            except (ValueError, RuntimeError) as e:
+                print(f"   step 5 review rejected ({e}); keeping the draft", flush=True)
+            else:
+                box = revised
+                source = "steps+llm"
+                print("   step 5 review: accepted", flush=True)
+        elif not args.no_review:
+            print("   step 5 review: skipped, no API key", flush=True)
 
     box["suggested_by"] = f"agent+{source}"
     out_path = Path(args.out).resolve() if args.out else DEFAULT_OUT
@@ -175,24 +208,63 @@ def _compact_history(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return compact
 
 
-def _llm_search_box(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _print_report(report: Dict[str, Any]) -> None:
+    best = report.get("best_avg_combined_final")
+    best_txt = f"{best:.4f}" if isinstance(best, float) else "none"
+    losses = report.get("losses") if isinstance(report.get("losses"), dict) else {}
+    loss_txt = " ".join(
+        f"{key}={losses[key]:.4f}" if isinstance(losses.get(key), float) else f"{key}=na"
+        for key in ("indel", "snp", "fp")
+    )
+    print(
+        f"   step 1 diagnose: bottleneck={report.get('bottleneck')} "
+        f"best={best_txt} from {report.get('best_category')}  v2 loss {loss_txt}",
+        flush=True,
+    )
+    last = report.get("last_category")
+    print(
+        f"   step 2 review: last={last} state={report.get('last_state')}",
+        flush=True,
+    )
+    print(
+        f"   step 3 choose: {report.get('choice')} ({report.get('reason')})",
+        flush=True,
+    )
+    print(
+        f"   step 4 bounds: {report.get('bounds')} n_trials={report.get('n_trials')}",
+        flush=True,
+    )
+
+
+def _llm_review(report: Dict[str, Any], draft: Dict[str, Any]) -> Dict[str, Any]:
     user = json.dumps(
         {
             "catalog": space_catalog(),
-            "history": history,
-            "instruction": (
-                "Choose the next search box from catalog + history. "
-                "Return JSON only."
-            ),
+            "diagnosis": report,
+            "draft": draft,
+            "instruction": "Revise the draft only if the diagnosis shows a mistake. Return JSON only.",
         },
         default=str,
     )
+    return _parse_json_object(_chat(REVIEW_PROMPT, user))
+
+
+def _llm_search_box(history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return _parse_json_object(_chat(SYSTEM_PROMPT, json.dumps(
+        {
+            "catalog": space_catalog(),
+            "history": history,
+            "instruction": "Choose the next search box from catalog + history. Return JSON only.",
+        },
+        default=str,
+    )))
+
+
+def _chat(system: str, user: str) -> str:
     provider = (os.environ.get("LLM_PROVIDER") or "").strip().lower()
     if provider == "openai" or (not provider and os.environ.get("OPENAI_API_KEY")):
-        text = _openai_chat(SYSTEM_PROMPT, user)
-    else:
-        text = _anthropic_chat(SYSTEM_PROMPT, user)
-    return _parse_json_object(text)
+        return _openai_chat(system, user)
+    return _anthropic_chat(system, user)
 
 
 def _has_llm_key() -> bool:
@@ -311,7 +383,17 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     p.add_argument(
         "--heuristic",
         action="store_true",
-        help="Skip the LLM and emit the rule-based box.",
+        help="Use the old single-rule box instead of the multi-step agent.",
+    )
+    p.add_argument(
+        "--no-review",
+        action="store_true",
+        help="Skip the optional LLM revision of the multi-step draft.",
+    )
+    p.add_argument(
+        "--once",
+        action="store_true",
+        help="One LLM call from raw history. Requires an API key.",
     )
     p.add_argument(
         "--include-failed",
