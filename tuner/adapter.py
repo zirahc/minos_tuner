@@ -121,6 +121,8 @@ def import_rows(
     from optuna.trial import TrialState, create_trial
 
     key_tuple = tuple(keys) if keys else None
+    # Callers still pass the tightened box. Import ignores it and uses the catalog.
+    del distributions
     existing = {
         str(t.user_attrs.get("config_id"))
         for t in study.trials
@@ -149,8 +151,8 @@ def import_rows(
             skipped += 1
             continue
         trial_distributions = {
-            key: _distribution_containing(optuna, category, key, distributions.get(key), value)
-            for key, value in params.items()
+            key: _to_distribution(optuna, space_for(category)[key])
+            for key in params
         }
         try:
             trial = create_trial(
@@ -178,38 +180,6 @@ def import_rows(
         existing.add(config_id)
         added += 1
     return added, skipped
-
-
-def _distribution_containing(
-    optuna: Any,
-    category: str,
-    key: str,
-    dist: Any,
-    value: Any,
-) -> Any:
-    """Keep the search-box distribution when the historical value fits.
-
-    Older rows can sit outside a tightened box. Those trials use the catalog
-    range so warm-start does not reject them.
-    """
-    if dist is not None and _value_in_distribution(dist, value):
-        return dist
-    return _to_distribution(optuna, space_for(category)[key])
-
-
-def _value_in_distribution(dist: Any, value: Any) -> bool:
-    choices = getattr(dist, "choices", None)
-    if choices is not None:
-        return value in tuple(choices)
-    low = getattr(dist, "low", None)
-    high = getattr(dist, "high", None)
-    if low is None or high is None:
-        return True
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return False
-    return float(low) <= number <= float(high)
 
 
 def _to_distribution(optuna: Any, spec: Any) -> Any:
