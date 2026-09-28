@@ -36,6 +36,7 @@ def insert_pending_config(
     worker_id: Optional[str] = None,
     batch_id: Optional[str] = None,
     rounds_target: Optional[int] = None,
+    status: str = "pending",
 ) -> Optional[str]:
     row = {
         "experiment": experiment,
@@ -47,7 +48,7 @@ def insert_pending_config(
         "suggested_by": box.get("suggested_by") or "optuna",
         "hypothesis": box.get("hypothesis"),
         "optuna_trial_number": trial_number,
-        "status": "pending",
+        "status": status,
     }
     if worker_id:
         row["worker_id"] = str(worker_id)
@@ -70,6 +71,35 @@ def list_pending(limit: int = 1) -> List[Dict[str, Any]]:
     ])
     data = rest_json("GET", config_table(), query=query)
     return data if isinstance(data, list) else []
+
+
+def list_queued() -> Optional[List[Dict[str, Any]]]:
+    """Trials waiting for a free VPS. main.py does not claim these."""
+    query = "&".join([
+        "select=*",
+        "status=eq.queued",
+        "order=created_at.asc",
+    ])
+    data = rest_json("GET", config_table(), query=query)
+    if data is None:
+        return None
+    return data if isinstance(data, list) else []
+
+
+def assign_queued(config_id: str, worker_id: str) -> Optional[Dict[str, Any]]:
+    """Give the next stacked trial to one free VPS."""
+    claimed = rest_json(
+        "PATCH",
+        config_table(),
+        query="&".join([
+            f"id=eq.{urllib.parse.quote(str(config_id), safe='')}",
+            "status=eq.queued",
+        ]),
+        body={"status": "pending", "worker_id": str(worker_id)},
+    )
+    if isinstance(claimed, list) and claimed and isinstance(claimed[0], dict):
+        return claimed[0]
+    return None
 
 
 def list_jobs_for_workers(

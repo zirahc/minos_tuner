@@ -104,8 +104,11 @@ def open_study(optuna: Any, study_name: str, storage: str, reset: bool = False) 
         storage=storage,
         direction="maximize",
         load_if_exists=True,
-        sampler=optuna.samplers.TPESampler(seed=42),
+        sampler=optuna.samplers.TPESampler(seed=42, constant_liar=True),
     )
+    # create_study keeps the sampler already stored on an existing study.
+    # Set it again so a batch of asks does not all land on the same point.
+    study.sampler = optuna.samplers.TPESampler(seed=42, constant_liar=True)
     print(f"   study={study_name}  storage={_storage_label(storage)}", flush=True)
     return study
 

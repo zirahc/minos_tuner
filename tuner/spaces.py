@@ -1,7 +1,9 @@
 """GATK search spaces: one category = one Optuna study.
 
-Only these keys are imported from historical gatk_config rows.
-Other GATK params stay frozen for that study.
+Ranges match the validator tool schema. A submitted value outside these
+bounds is defaulted, so Optuna never suggests past them. Parameters with
+only one allowed value (sample_ploidy=2, dont_use_soft_clipped_bases=false)
+are omitted and stay at the GATK default.
 """
 from __future__ import annotations
 
@@ -23,11 +25,11 @@ class ParamSpec:
 
 SPACES: Dict[str, Dict[str, ParamSpec]] = {
     "quality_filters": {
-        "min_base_quality_score": ParamSpec("int", 10, low=0, high=50),
+        "min_base_quality_score": ParamSpec("int", 10, low=10, high=50),
         "min_mapping_quality_score": ParamSpec("int", 20, low=0, high=60),
         "base_quality_score_threshold": ParamSpec("int", 18, low=0, high=50),
         "standard_min_confidence_threshold_for_calling": ParamSpec(
-            "float", 30.0, low=10.0, high=50.0
+            "float", 30.0, low=30.0, high=100.0
         ),
     },
     "pcr": {
@@ -45,13 +47,13 @@ SPACES: Dict[str, Dict[str, ParamSpec]] = {
         ),
     },
     "assembly": {
-        "min_pruning": ParamSpec("int", 2, low=1, high=10),
+        "min_pruning": ParamSpec("int", 2, low=2, high=10),
         "max_alternate_alleles": ParamSpec("int", 6, low=1, high=20),
-        "min_dangling_branch_length": ParamSpec("int", 4, low=1, high=20),
+        "min_dangling_branch_length": ParamSpec("int", 4, low=2, high=20),
         "recover_all_dangling_branches": ParamSpec(
             "categorical", False, choices=(False, True)
         ),
-        "max_num_haplotypes_in_population": ParamSpec("int", 128, low=8, high=512),
+        "max_num_haplotypes_in_population": ParamSpec("int", 128, low=8, high=128),
         "adaptive_pruning_initial_error_rate": ParamSpec(
             "float", 0.001, low=0.0001, high=0.1, log=True
         ),
@@ -59,10 +61,10 @@ SPACES: Dict[str, Dict[str, ParamSpec]] = {
     },
     "active_region": {
         "active_probability_threshold": ParamSpec(
-            "float", 0.002, low=0.0001, high=0.05, log=True
+            "float", 0.002, low=0.001, high=0.05, log=True
         ),
         "min_assembly_region_size": ParamSpec("int", 50, low=1, high=300),
-        "max_assembly_region_size": ParamSpec("int", 300, low=100, high=1000),
+        "max_assembly_region_size": ParamSpec("int", 300, low=100, high=700),
         "assembly_region_padding": ParamSpec("int", 100, low=0, high=500),
     },
     "pair_hmm": {
@@ -74,14 +76,10 @@ SPACES: Dict[str, Dict[str, ParamSpec]] = {
         "indel_heterozygosity": ParamSpec(
             "float", 0.000125, low=0.00001, high=0.001, log=True
         ),
-        "sample_ploidy": ParamSpec("int", 2, low=1, high=10),
-        "contamination_fraction_to_filter": ParamSpec("float", 0.0, low=0.0, high=0.5),
+        "contamination_fraction_to_filter": ParamSpec("float", 0.0, low=0.0, high=0.05),
     },
     "downsampling": {
-        "max_reads_per_alignment_start": ParamSpec("int", 50, low=0, high=1000),
-        "dont_use_soft_clipped_bases": ParamSpec(
-            "categorical", False, choices=(False, True)
-        ),
+        "max_reads_per_alignment_start": ParamSpec("int", 50, low=25, high=300),
     },
 }
 
