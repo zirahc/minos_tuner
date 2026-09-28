@@ -250,6 +250,10 @@ def _run_assigned_job(
             cwd=str(root),
         )
         scores = _scores_since(stage, started)
+        print(
+            f"   posting {len(scores)} individual round row(s) to gatk_evaluations",
+            flush=True,
+        )
         scored_ok = [s for s in scores if s.get("ok") and s.get("combined_final") is not None]
         posted = post_evaluations(config_id, scores)
         status = "scored" if posted and scored_ok else "failed"
@@ -331,20 +335,39 @@ def _remove_link(path: Path) -> None:
 
 
 def _scores_since(practice_dir: Path, started: float) -> List[Dict[str, Any]]:
+    """One score_details.json per practice round. Does not average them."""
     scores: List[Dict[str, Any]] = []
+    missing: List[str] = []
     if not practice_dir.is_dir():
         return scores
-    for json_path in sorted(practice_dir.glob("*/score_run/score_details.json")):
+    children = sorted(
+        child for child in practice_dir.iterdir()
+        if child.is_dir()
+    )
+    for child in children:
+        json_path = child / "score_run" / "score_details.json"
+        if not json_path.is_file():
+            missing.append(child.name)
+            continue
         try:
             if json_path.stat().st_mtime + 1 < started:
+                missing.append(child.name)
                 continue
             data = json.loads(json_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as e:
             print(f"   WARNING: skip {json_path}: {e}", flush=True)
+            missing.append(child.name)
             continue
         if isinstance(data, dict):
+            data.setdefault("folder", str(child))
             data.setdefault("score_details_path", str(json_path))
             scores.append(data)
+    if missing:
+        print(
+            f"   WARNING: {len(missing)} round(s) had no new score file: "
+            + ", ".join(missing),
+            flush=True,
+        )
     return scores
 
 

@@ -148,27 +148,68 @@ def import_rows(
             print(f"   skip {config_id}: {e}", flush=True)
             skipped += 1
             continue
-        trial = create_trial(
-            params=params,
-            distributions=distributions,
-            values=[score],
-            state=TrialState.COMPLETE,
-            user_attrs={
-                "config_id": config_id,
-                "experiment": row.get("experiment"),
-                "avg_core": row.get("avg_core"),
-                "avg_germline": row.get("avg_germline"),
-                "avg_fp_per_target": row.get("avg_fp_per_target"),
-                "avg_f1_snp": row.get("avg_f1_snp"),
-                "avg_f1_indel": row.get("avg_f1_indel"),
-                "hypothesis": row.get("hypothesis"),
-                "suggested_by": row.get("suggested_by"),
-            },
-        )
+        trial_distributions = {
+            key: _distribution_containing(optuna, category, key, distributions.get(key), value)
+            for key, value in params.items()
+        }
+        try:
+            trial = create_trial(
+                params=params,
+                distributions=trial_distributions,
+                values=[score],
+                state=TrialState.COMPLETE,
+                user_attrs={
+                    "config_id": config_id,
+                    "experiment": row.get("experiment"),
+                    "avg_core": row.get("avg_core"),
+                    "avg_germline": row.get("avg_germline"),
+                    "avg_fp_per_target": row.get("avg_fp_per_target"),
+                    "avg_f1_snp": row.get("avg_f1_snp"),
+                    "avg_f1_indel": row.get("avg_f1_indel"),
+                    "hypothesis": row.get("hypothesis"),
+                    "suggested_by": row.get("suggested_by"),
+                },
+            )
+        except ValueError as e:
+            print(f"   skip {config_id}: {e}", flush=True)
+            skipped += 1
+            continue
         study.add_trial(trial)
         existing.add(config_id)
         added += 1
     return added, skipped
+
+
+def _distribution_containing(
+    optuna: Any,
+    category: str,
+    key: str,
+    dist: Any,
+    value: Any,
+) -> Any:
+    """Keep the search-box distribution when the historical value fits.
+
+    Older rows can sit outside a tightened box. Those trials use the catalog
+    range so warm-start does not reject them.
+    """
+    if dist is not None and _value_in_distribution(dist, value):
+        return dist
+    return _to_distribution(optuna, space_for(category)[key])
+
+
+def _value_in_distribution(dist: Any, value: Any) -> bool:
+    choices = getattr(dist, "choices", None)
+    if choices is not None:
+        return value in tuple(choices)
+    low = getattr(dist, "low", None)
+    high = getattr(dist, "high", None)
+    if low is None or high is None:
+        return True
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return float(low) <= number <= float(high)
 
 
 def _to_distribution(optuna: Any, spec: Any) -> Any:
