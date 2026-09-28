@@ -2,9 +2,9 @@
 """Download every Minos practice sample (BAM + truth + mutations).
 
 Talks to the platform's practice namespace with an ephemeral keypair — no
-wallet, no chain, no submission. Files land under datasets/practice/ in the
-same hashed round_* folders the miner uses, so later --practice / scoring
-runs can reuse them.
+wallet, no chain, no submission. For each chromosome in the download, the
+reference FASTA and RTG SDF are fetched first when they are missing.
+Samples and references are written under $MINOS_SUBNET/datasets/.
 
 This does not score anything and does not earn TAO.
 
@@ -25,17 +25,59 @@ import os
 import secrets
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv(REPO_ROOT / ".env")
-except ImportError:
-    pass
+
+def _load_local_env() -> None:
+    """Load tuner .env files. Never print values."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(REPO_ROOT / ".env")
+        load_dotenv(REPO_ROOT / ".env.tuner")
+        return
+    except ImportError:
+        pass
+    for name in (".env", ".env.tuner"):
+        path = REPO_ROOT / name
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for raw in lines:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+_load_local_env()
+
+_subnet_raw = (os.getenv("MINOS_SUBNET") or "").strip()
+if not _subnet_raw:
+    print(
+        "ERROR: set MINOS_SUBNET in .env to the minos_subnet checkout. "
+        "Downloads go to that checkout's datasets/ folder.",
+        flush=True,
+    )
+    sys.exit(2)
+SUBNET_ROOT = Path(_subnet_raw).expanduser().resolve()
+if not SUBNET_ROOT.is_dir():
+    print(f"ERROR: MINOS_SUBNET is not a directory: {SUBNET_ROOT}", flush=True)
+    sys.exit(2)
+sys.path.insert(0, str(SUBNET_ROOT))
 
 from bittensor_wallet import Keypair
 
@@ -47,9 +89,27 @@ from utils.platform_client import (
     PlatformConfig,
 )
 
-PRACTICE_DIR = REPO_ROOT / "datasets" / "practice"
+DATASETS_DIR = SUBNET_ROOT / "datasets"
+PRACTICE_DIR = DATASETS_DIR / "practice"
+REFERENCE_DIR = DATASETS_DIR / "reference"
 DEFAULT_PLATFORM_URL = "https://api.theminos.ai"
+DEFAULT_REF_BASE = "https://api.theminos.ai/reference"
 SAMTOOLS_IMAGE = "quay.io/biocontainers/samtools:1.20--h50ea8bc_0"
+# api.theminos.ai/reference rejects the default Python urllib user agent.
+REF_USER_AGENT = "minos-installer/0.1 (+https://github.com/minos-protocol/minos_subnet)"
+FASTA_EXTS = ("fa", "fa.fai", "dict")
+SDF_FILES = (
+    "done",
+    "mainIndex",
+    "nameIndex0",
+    "namedata0",
+    "namepointer0",
+    "progress",
+    "seqdata0",
+    "seqpointer0",
+    "sequenceIndex0",
+    "summary.txt",
+)
 
 # Metadata written next to the files. Never include presigned URLs.
 _META_KEYS = ("sample_id", "chromosome", "region", "num_mutations")
@@ -63,7 +123,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("  DOWNLOAD PRACTICE SAMPLES", flush=True)
     print("=" * 72, flush=True)
     print(f"  Platform:  {platform_url}", flush=True)
-    print(f"  Dest:      {PRACTICE_DIR}", flush=True)
+    print(f"  Subnet:    {SUBNET_ROOT}", flush=True)
+    print(f"  Practice:  {PRACTICE_DIR}", flush=True)
+    print(f"  Reference: {REFERENCE_DIR}", flush=True)
     if args.type:
         print(f"  Type:      {', '.join(_parse_types(args.type))}", flush=True)
     print(flush=True)
@@ -235,6 +297,10 @@ async def _run(
             return 2
         chosen = [match]
 
+    chroms = _chroms_for_samples(chosen)
+    if not _ensure_references(chroms):
+        return 2
+
     print(f"  Samples:   {len(chosen)} of {len(samples)} on the menu", flush=True)
     for i, sample in enumerate(chosen, 1):
         print(
@@ -282,6 +348,101 @@ async def _run(
             print(f"  - {sid}", flush=True)
         return 1
     return 0
+
+
+def _chroms_for_samples(samples: List[Dict[str, Any]]) -> List[str]:
+    chroms: List[str] = []
+    seen = set()
+    for sample in samples:
+        chrom = _sample_type(sample)
+        if chrom and chrom not in seen:
+            seen.add(chrom)
+            chroms.append(chrom)
+    return chroms
+
+
+def _ensure_references(chroms: List[str]) -> bool:
+    """Download FASTA + RTG SDF for each chromosome that is not already on disk."""
+    if not chroms:
+        print("ERROR: chosen samples have no chromosome, so no reference can be fetched.", flush=True)
+        return False
+    ref_base = (os.getenv("REF_S3_BASE") or DEFAULT_REF_BASE).rstrip("/")
+    print(f"  Reference: {REFERENCE_DIR}", flush=True)
+    for chrom in chroms:
+        if not _ensure_one_reference(chrom, ref_base):
+            return False
+    print(flush=True)
+    return True
+
+
+def _ensure_one_reference(chrom: str, ref_base: str) -> bool:
+    fa_dir = REFERENCE_DIR / chrom
+    fa_path = fa_dir / f"{chrom}.fa"
+    sdf_dir = fa_dir / f"{chrom}.sdf"
+    fasta_ready = fa_path.is_file() and fa_path.stat().st_size > 0
+    sdf_ready = (sdf_dir / "seqdata0").is_file()
+    if fasta_ready and sdf_ready and _fasta_sidecars_ready(fa_dir, chrom):
+        print(f"  Reference {chrom} already present", flush=True)
+        return True
+
+    print(f"  Fetching reference for {chrom}...", flush=True)
+    fa_dir.mkdir(parents=True, exist_ok=True)
+    for ext in FASTA_EXTS:
+        dest = fa_dir / f"{chrom}.{ext}"
+        if dest.is_file() and dest.stat().st_size > 0:
+            continue
+        url = f"{ref_base}/{chrom}/{chrom}.{ext}"
+        if not _download_ref_file(url, dest):
+            print(f"   ERROR: could not download {chrom}.{ext}", flush=True)
+            return False
+    if not sdf_ready:
+        sdf_dir.mkdir(parents=True, exist_ok=True)
+        for name in SDF_FILES:
+            dest = sdf_dir / name
+            if dest.is_file() and dest.stat().st_size > 0:
+                continue
+            url = f"{ref_base}/{chrom}/{chrom}.sdf/{name}"
+            if not _download_ref_file(url, dest):
+                print(f"   ERROR: could not download {chrom}.sdf/{name}", flush=True)
+                return False
+    print(f"  Reference {chrom} ready", flush=True)
+    return True
+
+
+def _fasta_sidecars_ready(fa_dir: Path, chrom: str) -> bool:
+    for ext in ("fa.fai", "dict"):
+        path = fa_dir / f"{chrom}.{ext}"
+        if not path.is_file() or path.stat().st_size == 0:
+            return False
+    return True
+
+
+def _download_ref_file(url: str, dest: Path) -> bool:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".part")
+    req = urllib.request.Request(url, headers={"User-Agent": REF_USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            if not (200 <= resp.status < 300):
+                return False
+            with tmp.open("wb") as out:
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+        if not tmp.is_file() or tmp.stat().st_size == 0:
+            tmp.unlink(missing_ok=True)
+            return False
+        tmp.replace(dest)
+        return True
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        print(f"   ERROR: {url} ({e})", flush=True)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
 
 
 def _download_practice_files(sample: dict, force: bool = False) -> Optional[dict]:
