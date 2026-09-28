@@ -15,8 +15,8 @@ from tuner.v2_score import component_losses
 # Order is the next lever for that limiter. A plateaued category is skipped.
 BOTTLENECK_PLAN: Dict[str, Tuple[str, ...]] = {
     "no_history": ("quality_filters",),
-    "false_positives": ("quality_filters", "downsampling", "emit", "pair_hmm"),
-    "indel": ("pcr", "assembly", "pair_hmm", "priors"),
+    "false_positives": ("quality_filters", "downsampling", "pair_hmm"),
+    "indel": ("assembly", "pair_hmm", "priors"),
     "sensitivity": ("active_region", "assembly", "priors", "quality_filters"),
     "broad": (
         "assembly",
@@ -24,8 +24,6 @@ BOTTLENECK_PLAN: Dict[str, Tuple[str, ...]] = {
         "priors",
         "pair_hmm",
         "downsampling",
-        "pcr",
-        "emit",
         "quality_filters",
     ),
 }

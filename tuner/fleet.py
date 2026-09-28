@@ -181,16 +181,41 @@ def _build_stack(args: argparse.Namespace) -> bool:
     print(f"   warm-start imported={added} skipped={skipped}", flush=True)
     _settle_running(study, study_name, TrialState)
 
+    distinct = _distinct_settings(box["space"])
+    target = args.batch if distinct is None else min(args.batch, distinct)
+    if distinct is not None and distinct < args.batch:
+        print(
+            f"   {category} has {distinct} setting(s); stack uses {target} "
+            "so the same option is not scored twice",
+            flush=True,
+        )
+        for params in _enumerate_settings(box["space"]):
+            try:
+                study.enqueue_trial(params)
+            except Exception as e:  # noqa: BLE001
+                print(f"   WARNING: could not enqueue {params}: {e}", flush=True)
+                break
+    else:
+        print(f"   stack target={target}", flush=True)
+
     batch_id = str(uuid.uuid4())
     placed = 0
-    for i in range(1, args.batch + 1):
+    seen = set()
+    attempts = 0
+    while placed < target and attempts < target * 4:
+        attempts += 1
         try:
             trial = study.ask(fixed_distributions=distributions)
         except TypeError:
             trial = study.ask(distributions)
         params = dict(trial.params)
+        signature = tuple(sorted((key, str(value)) for key, value in params.items()))
+        if signature in seen:
+            _tell_state(study, trial.number, TrialState.FAIL)
+            continue
+        seen.add(signature)
         experiment = f"optuna-{category}-t{trial.number}"
-        print(f"   stack [{i}/{args.batch}] trial={trial.number} {params}", flush=True)
+        print(f"   stack [{placed + 1}/{target}] trial={trial.number} {params}", flush=True)
         config_id = insert_pending_config(
             experiment=experiment,
             updates=params,
@@ -296,6 +321,53 @@ def _tell_state(study: Any, number: int, state: Any = None, value: Optional[floa
             study.tell(int(number), value)
     except Exception as e:  # noqa: BLE001
         print(f"   WARNING: tell trial={number} failed: {e}", flush=True)
+
+
+def _distinct_settings(space: Dict[str, Any]) -> Optional[int]:
+    """Number of different settings in a discrete box. None when a float range remains."""
+    total = 1
+    for spec in space.values():
+        if not isinstance(spec, dict):
+            continue
+        kind = spec.get("type")
+        if kind == "float":
+            try:
+                if float(spec["high"]) > float(spec["low"]):
+                    return None
+            except (KeyError, TypeError, ValueError):
+                continue
+        elif kind == "int":
+            try:
+                span = int(spec["high"]) - int(spec["low"]) + 1
+            except (KeyError, TypeError, ValueError):
+                continue
+            if span > 1:
+                total *= span
+        elif kind == "categorical":
+            count = len(spec.get("choices") or [])
+            if count > 1:
+                total *= count
+        if total > 100000:
+            return None
+    return max(1, total)
+
+
+def _enumerate_settings(space: Dict[str, Any]) -> List[Dict[str, Any]]:
+    dims: List[tuple] = []
+    for key, spec in space.items():
+        kind = spec.get("type")
+        if kind == "categorical":
+            dims.append((key, list(spec.get("choices") or [])))
+        elif kind == "int":
+            dims.append((key, list(range(int(spec["low"]), int(spec["high"]) + 1))))
+        else:
+            return []
+    if not dims:
+        return []
+    rows: List[Dict[str, Any]] = [{}]
+    for key, values in dims:
+        rows = [{**row, key: value} for row in rows for value in values]
+    return rows
 
 
 def _workers(raw: str) -> List[str]:

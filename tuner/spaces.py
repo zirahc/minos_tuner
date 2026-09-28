@@ -4,6 +4,9 @@ Ranges match the validator tool schema. A submitted value outside these
 bounds is defaulted, so Optuna never suggests past them. Parameters with
 only one allowed value (sample_ploidy=2, dont_use_soft_clipped_bases=false)
 are omitted and stay at the GATK default.
+
+Deferred until the numeric ranges have been searched:
+emit_ref_confidence, pcr_indel_model, recover_all_dangling_branches.
 """
 from __future__ import annotations
 
@@ -32,27 +35,10 @@ SPACES: Dict[str, Dict[str, ParamSpec]] = {
             "float", 30.0, low=30.0, high=100.0
         ),
     },
-    "pcr": {
-        "pcr_indel_model": ParamSpec(
-            "categorical",
-            "CONSERVATIVE",
-            choices=("NONE", "HOSTILE", "AGGRESSIVE", "CONSERVATIVE"),
-        ),
-    },
-    "emit": {
-        "emit_ref_confidence": ParamSpec(
-            "categorical",
-            "NONE",
-            choices=("NONE", "GVCF", "BP_RESOLUTION"),
-        ),
-    },
     "assembly": {
         "min_pruning": ParamSpec("int", 2, low=2, high=10),
         "max_alternate_alleles": ParamSpec("int", 6, low=1, high=20),
         "min_dangling_branch_length": ParamSpec("int", 4, low=2, high=20),
-        "recover_all_dangling_branches": ParamSpec(
-            "categorical", False, choices=(False, True)
-        ),
         "max_num_haplotypes_in_population": ParamSpec("int", 128, low=8, high=128),
         "adaptive_pruning_initial_error_rate": ParamSpec(
             "float", 0.001, low=0.0001, high=0.1, log=True

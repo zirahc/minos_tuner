@@ -31,8 +31,8 @@ Points still on the table from the best row:
   fp_loss    = 0.30 * (1 - exp(-fp_per_target / 8))
 Parameters move f1_indel, f1_snp, or fp_per_target. avg_combined_final moves only through those.
 Open the category that attacks the largest loss. Optuna still maximizes avg_combined_final inside that box.
-indel_loss: pcr, then assembly, pair_hmm, priors.
-fp_loss: quality_filters, then downsampling, emit, pair_hmm.
+indel_loss: assembly, then pair_hmm, priors.
+fp_loss: quality_filters, then downsampling, pair_hmm.
 snp_loss: active_region, then assembly, priors, quality_filters.
 """
 

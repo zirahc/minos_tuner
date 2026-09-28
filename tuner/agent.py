@@ -154,9 +154,9 @@ def heuristic_search_box(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         and f1_snp is not None
         and f1_indel + 0.02 < f1_snp
     ):
-        category = "pcr"
+        category = "assembly"
         hypothesis = (
-            "INDEL F1 lags SNP F1. Search the PCR indel model before touching SNP priors."
+            "INDEL F1 lags SNP F1. Search assembly before the deferred PCR indel model."
         )
     elif not scored:
         category = "quality_filters"
