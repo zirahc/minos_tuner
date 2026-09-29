@@ -181,8 +181,8 @@ def run_wait_loop(args: argparse.Namespace) -> int:
     print("=" * 72, flush=True)
     print(f"   worker={worker_id}  MINOS={root}  poll={args.poll}s", flush=True)
     print("   stop with Ctrl+C", flush=True)
-    try:
-        while True:
+    while True:
+        try:
             job = claim_worker_job(worker_id)
             if not job:
                 print(f"   worker={worker_id} waiting for a GATK update ...", flush=True)
@@ -197,9 +197,16 @@ def run_wait_loop(args: argparse.Namespace) -> int:
                 rounds_override=args.rounds,
                 patch_config=patch_config,
             )
-    except KeyboardInterrupt:
-        print(f"\n   worker={worker_id} stopped", flush=True)
-        return 0
+        except KeyboardInterrupt:
+            print(f"\n   worker={worker_id} stopped", flush=True)
+            return 0
+        except Exception as e:
+            print(
+                f"   ERROR: {type(e).__name__}: {e} — worker={worker_id} "
+                "retries in 60s",
+                flush=True,
+            )
+            time.sleep(60)
 
 
 def _run_assigned_job(
@@ -907,14 +914,15 @@ def _patch_config_status(config_id: str, status: str) -> bool:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=60) as resp:
             print(f"   PATCH {config_table} status={status}  HTTP {resp.status}", flush=True)
             return 200 <= resp.status < 300
     except urllib.error.HTTPError as e:
         print(f"   WARNING: could not PATCH status={status}: HTTP {e.code}", flush=True)
         return False
-    except urllib.error.URLError as e:
-        print(f"   WARNING: could not PATCH status: {e.reason}", flush=True)
+    except (TimeoutError, urllib.error.URLError, OSError) as e:
+        reason = getattr(e, "reason", e)
+        print(f"   WARNING: could not PATCH status: {reason}", flush=True)
         return False
 
 
@@ -1059,40 +1067,57 @@ def _supabase_insert(url: str, key: str, table: str, payload: Any) -> Optional[A
             "Prefer": "return=representation",
         },
     )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            print(f"   HTTP {resp.status}  {table}  {len(body)} bytes", flush=True)
-            if not (200 <= resp.status < 300):
-                preview = raw[:500] + ("..." if len(raw) > 500 else "")
-                if preview:
-                    print(f"   response: {preview}", flush=True)
-                return None
-            try:
-                return json.loads(raw) if raw else []
-            except ValueError:
-                print("   ERROR: insert response was not JSON", flush=True)
-                return None
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="replace")[:500]
-        print(f"   ERROR: HTTP {e.code} {e.reason}  table={table}", flush=True)
-        if err_body:
-            print(f"   {err_body}", flush=True)
-        if e.code == 404:
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                print(f"   HTTP {resp.status}  {table}  {len(body)} bytes", flush=True)
+                if not (200 <= resp.status < 300):
+                    preview = raw[:500] + ("..." if len(raw) > 500 else "")
+                    if preview:
+                        print(f"   response: {preview}", flush=True)
+                    return None
+                try:
+                    return json.loads(raw) if raw else []
+                except ValueError:
+                    print("   ERROR: insert response was not JSON", flush=True)
+                    return None
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")[:500]
+            if e.code in (408, 429, 500, 502, 503, 504) and attempt < 3:
+                print(
+                    f"   WARNING: HTTP {e.code} posting {table}; attempt {attempt}/3",
+                    flush=True,
+                )
+                time.sleep(5 * attempt)
+                continue
+            print(f"   ERROR: HTTP {e.code} {e.reason}  table={table}", flush=True)
+            if err_body:
+                print(f"   {err_body}", flush=True)
+            if e.code == 404:
+                print(
+                    f"   Hint: create table {table} in the Supabase SQL editor.",
+                    flush=True,
+                )
+            if e.code in (401, 403):
+                print(
+                    "   Hint: use the service-role key in SUPABASE_KEY, or add an "
+                    "INSERT policy on the table. Do not paste the key here.",
+                    flush=True,
+                )
+            return None
+        except (TimeoutError, urllib.error.URLError, OSError) as e:
+            reason = getattr(e, "reason", e)
             print(
-                f"   Hint: create table {table} in the Supabase SQL editor.",
+                f"   WARNING: post {table} failed ({reason}); attempt {attempt}/3",
                 flush=True,
             )
-        if e.code in (401, 403):
-            print(
-                "   Hint: use the service-role key in SUPABASE_KEY, or add an "
-                "INSERT policy on the table. Do not paste the key here.",
-                flush=True,
-            )
-        return None
-    except urllib.error.URLError as e:
-        print(f"   ERROR: could not reach Supabase: {e.reason}", flush=True)
-        return None
+            if attempt < 3:
+                time.sleep(5 * attempt)
+                continue
+            print(f"   ERROR: could not reach Supabase: {reason}", flush=True)
+            return None
+    return None
 
 
 def _inserted_id(inserted: Any) -> Optional[str]:

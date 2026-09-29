@@ -356,7 +356,7 @@ def _openai_chat(system: str, user: str) -> str:
 
 def _http_json(req: urllib.request.Request) -> Any:
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             payload = resp.read().decode("utf-8", errors="replace")
             if not (200 <= resp.status < 300):
                 raise RuntimeError(f"LLM HTTP {resp.status}")
@@ -364,8 +364,9 @@ def _http_json(req: urllib.request.Request) -> Any:
     except urllib.error.HTTPError as e:
         err = e.read().decode("utf-8", errors="replace")[:300]
         raise RuntimeError(f"LLM HTTP {e.code}: {err}") from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"LLM request failed: {e.reason}") from e
+    except (TimeoutError, urllib.error.URLError, OSError) as e:
+        reason = getattr(e, "reason", e)
+        raise RuntimeError(f"LLM request failed: {reason}") from e
 
 
 def _parse_json_object(text: str) -> Dict[str, Any]:

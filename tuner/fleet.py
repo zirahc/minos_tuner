@@ -80,18 +80,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("   the agent runs again after those checks finish", flush=True)
     print("   GATK VPS: set WORKER_ID and run python main.py", flush=True)
     print("   stop with Ctrl+C", flush=True)
-    try:
-        while True:
+    while True:
+        try:
             rc = run_once(args, workers)
-            if rc == 2:
-                print("   setup error — retrying in 60s", flush=True)
-                time.sleep(60)
-                continue
-            if rc != 0:
-                print(f"   stack returned {rc} — next cycle anyway", flush=True)
-    except KeyboardInterrupt:
-        print("\n   tuner stopped", flush=True)
-        return 0
+        except KeyboardInterrupt:
+            print("\n   tuner stopped", flush=True)
+            return 0
+        except Exception as e:
+            print(f"   ERROR: {type(e).__name__}: {e} — retrying in 60s", flush=True)
+            time.sleep(60)
+            continue
+        if rc == 2:
+            print("   setup error — retrying in 60s", flush=True)
+            time.sleep(60)
+            continue
+        if rc != 0:
+            print(f"   stack returned {rc} — next cycle anyway", flush=True)
 
 
 def run_once(args: argparse.Namespace, workers: List[str]) -> int:
