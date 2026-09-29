@@ -26,7 +26,13 @@ try:
 except ImportError:
     pass
 
-from tuner.adapter import DEFAULT_STORAGE, import_rows, open_study
+from tuner.adapter import (
+    DEFAULT_STORAGE,
+    catalog_categorical_distributions,
+    import_rows,
+    open_study,
+    reconcile_categorical_study,
+)
 from tuner.search_box import load_search_box, optuna_distributions
 from tuner.spaces import default_study_name
 from tuner.supabase_scores import fetch_config_scores
@@ -55,10 +61,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     n_trials = int(args.n_trials or box["n_trials"])
     study_name = args.study or default_study_name(category)
     storage = (os.environ.get("OPTUNA_STORAGE") or DEFAULT_STORAGE).strip()
-    distributions = optuna_distributions(space, optuna)
+    distributions = catalog_categorical_distributions(
+        category, optuna_distributions(space, optuna), optuna
+    )
     keys = list(space)
 
     study = open_study(optuna, study_name, storage, reset=args.reset)
+    study = reconcile_categorical_study(
+        study, optuna, study_name, storage, distributions
+    )
     _fail_dangling(study, TrialState)
     history = fetch_config_scores(category=category, scored_only=True)
     if history is None:

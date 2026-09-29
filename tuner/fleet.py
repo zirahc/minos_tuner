@@ -32,7 +32,13 @@ try:
 except ImportError:
     pass
 
-from tuner.adapter import DEFAULT_STORAGE, import_rows, open_study
+from tuner.adapter import (
+    DEFAULT_STORAGE,
+    catalog_categorical_distributions,
+    import_rows,
+    open_study,
+    reconcile_categorical_study,
+)
 from tuner.agent import main as agent_main
 from tuner.jobs import (
     assign_queued,
@@ -236,8 +242,13 @@ def _build_stack(args: argparse.Namespace) -> bool:
     study_name = args.study or default_study_name(category)
     box["study_name"] = study_name
     storage = (os.environ.get("OPTUNA_STORAGE") or DEFAULT_STORAGE).strip()
-    distributions = optuna_distributions(box["space"], optuna)
+    distributions = catalog_categorical_distributions(
+        category, optuna_distributions(box["space"], optuna), optuna
+    )
     study = open_study(optuna, study_name, storage, reset=False)
+    study = reconcile_categorical_study(
+        study, optuna, study_name, storage, distributions
+    )
     history = fetch_config_scores(category=None, scored_only=True)
     if history is None:
         return False
@@ -280,6 +291,11 @@ def _build_stack(args: argparse.Namespace) -> bool:
             trial = study.ask(fixed_distributions=distributions)
         except TypeError:
             trial = study.ask(distributions)
+        except ValueError as e:
+            if "dynamic value space" not in str(e):
+                raise
+            print(f"   ERROR: {e}", flush=True)
+            return False
         params = dict(trial.params)
         signature = tuple(sorted((key, str(value)) for key, value in params.items()))
         if signature in seen:

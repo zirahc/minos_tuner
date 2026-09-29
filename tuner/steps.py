@@ -289,26 +289,10 @@ def _full_spec(spec: ParamSpec) -> Dict[str, Any]:
 def _shrink_choices(
     rows: Sequence[Mapping[str, Any]], key: str, allowed: Sequence[Any]
 ) -> List[Any]:
-    allowed_list = list(allowed)
-    best: Dict[Any, float] = {}
-    for row in rows:
-        updates = row.get("gatk_updates")
-        if not isinstance(updates, dict) or key not in updates:
-            continue
-        matched = _match_choice(updates[key], allowed_list)
-        score = _num(row.get("avg_combined_final"))
-        if matched is None or score is None:
-            continue
-        best[matched] = max(score, best.get(matched, score))
-    if len(best) < 2:
-        return allowed_list
-    ranked = sorted(best, key=lambda choice: best[choice], reverse=True)
-    top = best[ranked[0]]
-    kept = [choice for choice in ranked if best[choice] >= top - 0.01]
-    if len(kept) < 2:
-        kept = ranked[:2]
-    ordered = [choice for choice in allowed_list if choice in kept]
-    return ordered or allowed_list
+    # A shorter choice list is a different CategoricalDistribution. Optuna
+    # rejects that on a study that already has the full list.
+    del rows, key
+    return list(allowed)
 
 
 def _shrink_int(values: Sequence[float], low: int, high: int) -> Tuple[int, int]:

@@ -114,7 +114,8 @@ def _validate_spec(key: str, allowed: ParamSpec, spec_in: Mapping[str, Any]) -> 
         for item in choices:
             if item not in allowed_choices:
                 raise ValueError(f"{key}: choice {item!r} not allowed")
-        return {"type": "categorical", "choices": choices}
+        # Optuna cannot change a categorical choice list after the first trial.
+        return {"type": "categorical", "choices": allowed_choices}
     low = spec_in.get("low", allowed.low)
     high = spec_in.get("high", allowed.high)
     try:

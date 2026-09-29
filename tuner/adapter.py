@@ -185,6 +185,89 @@ def import_rows(
     return added, skipped
 
 
+def catalog_categorical_distributions(
+    category: str,
+    distributions: Dict[str, Any],
+    optuna: Any,
+) -> Dict[str, Any]:
+    """Keep every categorical on the catalog choice list.
+
+    Int and float ranges may shrink. A categorical may not: Optuna raises
+    ``CategoricalDistribution does not support dynamic value space``.
+    """
+    catalog = space_for(category)
+    fixed = dict(distributions)
+    for key in list(fixed):
+        spec = catalog.get(key)
+        if spec is not None and spec.kind == "categorical":
+            fixed[key] = _to_distribution(optuna, spec)
+    return fixed
+
+
+def reconcile_categorical_study(
+    study: Any,
+    optuna: Any,
+    study_name: str,
+    storage: str,
+    distributions: Dict[str, Any],
+) -> Any:
+    """Rebuild a local study whose categorical choices differ from the catalog.
+
+    Scored history is imported again by the caller. Trials still running keep
+    the choice list already stored, so their tell still matches.
+    """
+    stored = _stored_categoricals(study)
+    conflicts = _categorical_conflicts(stored, distributions)
+    if not conflicts:
+        return study
+    if _has_open_trials(study):
+        print(
+            "   categorical choices are locked by trials still in this study; "
+            "using the stored choice list until those trials finish",
+            flush=True,
+        )
+        for key, old, new in conflicts:
+            print(f"   {key}: study={old} catalog={new}", flush=True)
+            distributions[key] = stored[key]
+        return study
+    for key, old, new in conflicts:
+        print(
+            f"   {key} choices in {study_name} are {old}; catalog is {new}. "
+            "Rebuilding this study from scored history.",
+            flush=True,
+        )
+    return open_study(optuna, study_name, storage, reset=True)
+
+
+def _stored_categoricals(study: Any) -> Dict[str, Any]:
+    stored: Dict[str, Any] = {}
+    for trial in study.trials:
+        for name, dist in getattr(trial, "distributions", {}).items():
+            if dist.__class__.__name__ == "CategoricalDistribution":
+                stored[name] = dist
+    return stored
+
+
+def _categorical_conflicts(
+    stored: Dict[str, Any], distributions: Dict[str, Any]
+) -> List[tuple]:
+    conflicts = []
+    for key, dist in distributions.items():
+        old = stored.get(key)
+        if old is None or dist.__class__.__name__ != "CategoricalDistribution":
+            continue
+        if list(old.choices) != list(dist.choices):
+            conflicts.append((key, list(old.choices), list(dist.choices)))
+    return conflicts
+
+
+def _has_open_trials(study: Any) -> bool:
+    for trial in study.trials:
+        if getattr(trial.state, "name", "") in ("RUNNING", "WAITING"):
+            return True
+    return False
+
+
 def _to_distribution(optuna: Any, spec: Any) -> Any:
     if spec.kind == "int":
         return optuna.distributions.IntDistribution(int(spec.low), int(spec.high))

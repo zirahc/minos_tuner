@@ -53,7 +53,7 @@ Rules:
 - Optimize avg_combined_final by attacking the largest v2 point loss.
 - Open exactly one search_category from the catalog.
 - space keys must be a subset of that category. Do not add other GATK keys.
-- Bounds must stay inside the catalog low/high (or choices).
+- Numeric low/high may shrink inside the catalog. Categorical choices must be the full catalog list. Optuna cannot change that list later.
 - Each parameter note names the v2 metric it moves. The hypothesis must name that metric and the direction.
 - Search only keys in the chosen category.
 - n_trials is 4..8.
