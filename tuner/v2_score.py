@@ -22,18 +22,25 @@ INDEL_CORE_SHARE = 0.80
 # Ignore a component until it can move the average by this much.
 MIN_LOSS = 0.005
 
-V2_BRIEF = """v2 ranking number is avg_combined_final (mean combined_final).
+V2_BRIEF = """Decision instruction. The only ranking number is avg_combined_final.
 combined_final = 0.70 * core + 0.30 * exp(-fp_per_target / 8).
-core is difficulty-weighted F1: SNP is 20% of core, INDEL is 80% of core.
+core is difficulty-weighted F1, not a count of variants:
+  snp_hom 0.02, snp_het 0.18, indel_1bp 0.40, indel_2_3bp 0.16,
+  indel_4_7bp 0.10, indel_8bp 0.14.
+1bp indels are the heaviest class. SNP hom is almost never the reason to open a category.
+There is no completeness score and no Ti/Tv quality penalty. A failed ti/tv or het/hom
+gate zeros the round; do not spend a search trying to nudge those ratios.
 Points still on the table from the best row:
   indel_loss = 0.70 * 0.80 * (1 - f1_indel)
   snp_loss   = 0.70 * 0.20 * (1 - f1_snp)
   fp_loss    = 0.30 * (1 - exp(-fp_per_target / 8))
-Parameters move f1_indel, f1_snp, or fp_per_target. avg_combined_final moves only through those.
-Open the category that attacks the largest loss. Optuna still maximizes avg_combined_final inside that box.
-indel_loss: assembly, then pair_hmm, priors.
-fp_loss: quality_filters, then downsampling, pair_hmm.
-snp_loss: active_region, then assembly, priors, quality_filters.
+A parameter changes avg_combined_final only by moving core F1 or fp_per_target.
+Read the parameter note for which of those it moves, and in which direction.
+Open the one category whose notes attack the largest loss.
+indel_loss: pcr, then assembly, pair_hmm, priors.
+fp_loss: quality_filters, then calling_confidence, pair_hmm, priors, downsampling.
+snp_loss: active_region, then calling_confidence, assembly, priors, quality_filters.
+The hypothesis must name that metric and the direction you will move the parameter.
 """
 
 

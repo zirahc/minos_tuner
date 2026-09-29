@@ -215,8 +215,13 @@ def _run_assigned_job(
     config_id = str(job.get("id") or "")
     updates = job.get("gatk_updates") if isinstance(job.get("gatk_updates"), dict) else {}
     rounds = int(rounds_override or job.get("rounds_target") or 15)
+    offset = int(job.get("rounds_offset") or 0)
     experiment = job.get("experiment") or config_id
-    print(f"\n   job {config_id}  {experiment}  rounds={rounds}  updates={updates}", flush=True)
+    print(
+        f"\n   job {config_id}  {experiment}  rounds={rounds}  "
+        f"offset={offset}  updates={updates}",
+        flush=True,
+    )
     try:
         original = conf.read_text(encoding="utf-8")
     except OSError as e:
@@ -234,7 +239,7 @@ def _run_assigned_job(
         gatk_params = read_gatk_conf(conf)
         stage = root / "datasets" / "practice_fleet"
         try:
-            n_rounds = stage_practice_rounds(practice, stage, rounds)
+            n_rounds = stage_practice_rounds(practice, stage, rounds, offset)
         except OSError as e:
             print(f"ERROR: could not stage {rounds} rounds: {e}", flush=True)
             patch_config(config_id, {"status": "failed", "gatk_config": gatk_params})
@@ -273,8 +278,8 @@ def _run_assigned_job(
             print(f"ERROR: could not restore {conf}: {e}", flush=True)
 
 
-def stage_practice_rounds(practice: Path, stage: Path, limit: int) -> int:
-    """Link the first `limit` complete round folders so every VPS scores the same set."""
+def stage_practice_rounds(practice: Path, stage: Path, limit: int, offset: int = 0) -> int:
+    """Link one shared slice of practice rounds so every VPS scores the same set."""
     if not practice.is_dir():
         print(f"ERROR: practice directory not found: {practice}", flush=True)
         return 0
@@ -284,7 +289,8 @@ def stage_practice_rounds(practice: Path, stage: Path, limit: int) -> int:
     else:
         stage.mkdir(parents=True, exist_ok=True)
     chosen = [folder for folder in sorted(practice.iterdir()) if _is_round_folder(folder)]
-    chosen = chosen[: max(1, int(limit))]
+    start = max(0, int(offset))
+    chosen = chosen[start : start + max(1, int(limit))]
     for folder in chosen:
         _link_dir(folder.resolve(), stage / folder.name)
     if len(chosen) < limit:

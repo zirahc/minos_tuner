@@ -85,6 +85,7 @@ alter table public.gatk_configs add column if not exists worker_id text;
 alter table public.gatk_configs add column if not exists batch_id uuid;
 alter table public.gatk_configs add column if not exists rounds_target integer;
 alter table public.gatk_configs add column if not exists rounds_done integer;
+alter table public.gatk_configs add column if not exists rounds_offset integer;
 
 create index if not exists gatk_evaluations_config_id_idx
   on public.gatk_evaluations (config_id);
@@ -128,7 +129,8 @@ select
   c.worker_id,
   c.batch_id,
   c.rounds_target,
-  c.rounds_done
+  c.rounds_done,
+  c.rounds_offset
 from public.gatk_configs c
 left join public.gatk_evaluations e on e.config_id = c.id
 group by c.id;

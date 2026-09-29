@@ -1,0 +1,258 @@
+# Minos Genomics Subnet – Architecture
+
+Minos is a Bittensor subnet (SN107) that creates a decentralised market for genomic variant calling. Miners run variant-calling pipelines and are incentivized to maximize accuracy; validators independently reproduce and score results and set on-chain weights.
+
+---
+
+## 1. Problem Statement
+
+Genomic variant calling accuracy is critical for real-world genomics, yet benchmarking is fragmented and untrustworthy. Minos turns this into a continuous, incentivized benchmarking network:
+
+- **Miners** run variant-calling pipelines (GATK, DeepVariant, or BCFtools — freebayes deprecated 2026-05-09 16:00 UTC) and earn rewards proportional to their accuracy.
+- **Validators** re-run miner configurations against round truth data — held back while submissions are open and released publicly after the round closes — and score results with hap.py, so every result is independently reproducible.
+- **The platform** generates synthetic benchmark BAMs (GIAB + HelixForge-inserted mutations) and coordinates rounds.
+
+---
+
+## 2. Round-Based Task Flow
+
+Each scoring round follows this lifecycle:
+
+```text
+PLATFORM
+  │  Creates round with: round_id, region (e.g. chr19:13M-23M, chr21:17M-22M),
+  │  mutated BAM (presigned S3 URL), truth VCF (released after the round closes)
+  │
+  ▼ status: "pending"  (round created, waiting for start time)
+  │
+  ▼ status: "open"
+MINERS
+  │  Poll /v2/round-status → download BAM → run variant calling
+  │  Submit: tool_name + tool_config (quality parameters only, no VCF)
+  │
+  ▼ status: "scoring"  (submission window closes)
+VALIDATORS
+  │  Poll /v2/get-scoring-rounds → get all miner submissions
+  │  For each miner: re-run their exact tool_config → score VCF with hap.py
+  │  Submit scores to platform → compute round weights → set weights on chain
+  │
+  ▼ status: "completed"
+```
+
+Key design choice: **miners submit configs, not VCFs**. Validators independently reproduce each miner's output. This makes scoring independently reproducible: a score comes from the validator's own run rather than from a submitted VCF.
+
+---
+
+## 3. Data Assets
+
+| Pool | Contents | Visibility |
+| --- | --- | --- |
+| Reference | GRCh38 FASTA + index + RTG SDF (chr1-chr22) | Public (downloaded by all) |
+| Benchmark BAM | GIAB donors (HG001-HG007) 100-300× per chromosome, downsampled | Public (via platform presigned URL) |
+| Truth VCF | GIAB + HelixForge-inserted synthetic mutations | Validators while submissions are open; released publicly after the round closes |
+| Mutations-only VCF | Synthetic mutations only (no GIAB variants) | Validators while submissions are open (primary scoring scope); released publicly after the round closes |
+| Confident BED | GIAB high-confidence regions per chromosome | Validators only (legacy GIAB-scoring support) |
+
+Synthetic mutations are inserted using HelixForge at positions recorded in the mutations VCF. The SHA-256 of each round's BAM, truth VCF, and mutations VCF is published before the round is served (`GET /verification/task-window`), and the files themselves are released after the submission window closes (`GET /verification/round/{round_id}`), so any participant can verify what a round used and reproduce its scoring — see [docs/verification.md](verification.md). Validators require the **mutations-only VCF** (synthetic variants only) for current production scoring; if it is not provided, the validator skips the round instead of falling back to GIAB/BED-only scoring. The confident BED path remains in the code for legacy GIAB-only scoring support.
+
+### Local file retention
+
+Files written under `output/` are cleaned up by the running neuron: the miner removes subdirectories older than 4 hours, and the validator removes `output/mutated_bams`, `output/merged_truth` and `output/scoring` older than 5 hours (also once at startup). Copy anything you want to keep out of `output/`.
+
+---
+
+## 4. Miner Interface
+
+Miners register on Bittensor and poll the platform for active rounds:
+
+```json
+POST /v2/round-status  →  {
+  "round_id", "status", "region",
+  "bam_presigned_url", "bam_index_presigned_url",
+  "time_remaining_seconds"
+}
+```
+
+On an active round, the miner:
+
+1. Downloads the BAM (cached across rounds; digest handling described under [Download integrity](#download-integrity))
+2. Runs its configured variant caller via Docker on the given region
+3. Submits its tool config (quality parameters only — no VCF uploaded):
+
+```json
+POST /v2/submit-config  →  {
+  "hotkey", "round_id", "tool_name", "tool_config",
+  "variant_count", "runtime_seconds", "timestamp", "nonce", "signature",
+  "config_commitment", "commitment_block", "config_nonce", "payment_proof"
+}
+```
+
+All API calls are authenticated via canonical request signing. Each request includes a `signature` (the Bittensor keypair signs `METHOD|PATH|BODY_HASH|TIMESTAMP|NONCE`) and a unique `nonce` to prevent replay attacks. That `nonce` is the anti-replay
+value for the request itself and is unrelated to `config_nonce`, which salts the
+config commitment.
+
+The last four fields are optional and each is **omitted from the body entirely when absent**, rather than sent as `null`, so the signed body is unchanged when they are not in use:
+
+| Field | When it is sent | What it is |
+| --- | --- | --- |
+| `config_commitment` | Only when the platform advertises `config_commitment_enabled: true` in `/scoring/network-config` | 64 hex chars: SHA-256 over domain, version, `netuid`, `round_id`, `hotkey`, `tool_name`, the nonce, and the canonical form of the *stripped* config. The same digest the miner publishes on chain, as `m1:<round8>:<commitment>` |
+| `commitment_block` | Only when the height the commitment landed at is known | Block height read off the extrinsic receipt. Absent when the chain write was rate-limited or failed, or when the height could not be determined; the commitment itself is still submitted |
+| `config_nonce` | With a commitment | The salt, revealed so the platform can recompute the digest. The config space is small enough to enumerate, so the commitment is salted |
+| `payment_proof` | Only when this round's free submission allowance is used up and the extra submission was paid for | Proof of the TAO payment, from `utils/submission_payment.py` |
+
+### Download integrity
+
+The platform publishes a digest alongside each round file (`bam_sha256`, `truth_vcf_sha256`, `mutations_vcf_sha256`). Where one is published, a cached file is reused only if it matches, and a mismatching cache is discarded and re-downloaded.
+
+Freshly downloaded bytes are checked against the same digest. Where a backup URL is configured, a mismatch on the primary defers to the backup before anything is accepted; if the backup does not produce a matching file either, the primary bytes are used and the mismatch is logged. Set `MINOS_ENFORCE_DOWNLOAD_SHA256` to `1`, `true`, `yes` or `on` to reject a mismatching download outright and fail the round instead — the stricter setting, and the one to use where a round must never be scored against unverified bytes. Files fetched without a published digest (the BAM index, for example) get an existence check only.
+
+### Supported tools
+
+| Template | Docker image |
+| --- | --- |
+| `gatk` | `broadinstitute/gatk:4.5.0.0` |
+| `deepvariant` | `google/deepvariant:1.5.0` |
+| `bcftools` | `quay.io/biocontainers/bcftools:1.20--h8b25389_0` |
+| `freebayes` | `staphb/freebayes:1.3.7` (DEPRECATED 2026-05-09; runner retained while in-flight pre-cutover rounds finish scoring, then removed in a follow-up release) |
+
+Miners tune quality parameters via `configs/<tool>.conf`. Infrastructure parameters (`threads`, `memory_gb`, `timeout`, `ref_build`, `num_threads`) are stripped before submission and cannot influence scoring.
+
+---
+
+## 5. Validator Loop
+
+Validators use **subset-based scoring** to scale across many miners. Instead of every validator scoring every miner (O(V×M)), the platform assigns each validator a primary miner range based on stake rank. Adjacent validators share a 20% overlap zone for integrity cross-checks.
+
+```python
+while True:
+    rounds = get_scoring_rounds()              # poll platform for rounds in scoring phase
+    for round in rounds:
+        assignment = get_assignment(round)      # primary + secondary miner lists
+        submissions = get_submissions(round)    # miner configs + presigned BAM/truth URLs
+        download_round_files(round)             # BAM, truth VCF, mutations VCF
+
+        # Per-job thread/memory and total concurrency are auto-tuned from
+        # host CPU/RAM (see auto_scoring_config). Primaries run as a barrier;
+        # secondaries are skipped if they'd start within 3 min of the deadline.
+        with bounded_concurrency(N=auto):
+            for miner in score_in_parallel(assignment.primary):
+                submit_score(miner)             # per-miner score + artifact pointers
+                update_round_score(miner.hotkey, miner.combined_final)
+            if not approaching_deadline():
+                for miner in score_in_parallel(assignment.secondary):
+                    submit_score(miner)
+                    update_round_score(miner.hotkey, miner.combined_final)
+
+        # After scoring window closes: fetch peer scores for gap miners,
+        # then record participation once using personal + backfilled hotkeys.
+        backfill = get_backfill_scores(round)   # commit-then-reveal
+        for entry in backfill:
+            update_round_score(entry.hotkey, entry.score)
+        record_round(personal_hotkeys + backfill_hotkeys)
+
+        weights = compute_weights()             # winner-heavy pruning dust
+        submit_weight_history(weights)          # platform dashboard/audit
+        if registered_on_subnet:
+            set_weights_on_chain(weights)       # Bittensor chain write
+    sleep(query_interval)
+```
+
+Each `score_in_parallel(miners)` starts each miner's tool in its own Docker container under the auto-tuned semaphore, then scores the resulting VCF with hap.py and updates/submits that miner's score. The platform weight-history submission happens for registered and unregistered validators; on-chain `set_weights` only runs when the validator hotkey is registered on the subnet.
+
+If the platform does not support assignments (e.g. single-validator testnet), the validator splits the round itself: it scores a head of `len(submissions) // <validators holding a permit>` miners as primary, then the remaining tail under the same deadline guard as secondary scoring — the tail is skipped when the scoring deadline is within 180s. Set `MINOS_FALLBACK_PRIMARY_N` to override the head size.
+
+### 5.1 Scoring formula
+
+hap.py computes SNP and INDEL precision/recall against the truth VCF, and the `AdvancedScorer` combines these into a final score (0–100).
+
+The active scoring version is published in network configuration (`scoring_version` in `/scoring/network-config`) and applied consistently by validators; each validator resolves it once per round. **v1** is described below. **v2** is difficulty-weighted — `100 x (0.70 x core + 0.30 x germline)` behind a plausibility gate — and is a different scale, so scores from the two are not comparable. [docs/scoring.md](scoring.md) describes both in full.
+
+v1 has four components:
+
+| Component | Weight | What it measures |
+| --- | --- | --- |
+| **Core F1** | 60% | Truth-weighted F1 across SNPs and INDELs, with nonlinear emphasis (γ=0.5) rewarding near-perfect callers |
+| **Completeness** | 15% | Average recall + coverage (1 − fraction unassessed) |
+| **FP Rate** | 15% | Penalises excess false positives and call counts diverging from truth |
+| **Quality** | 10% | Ti/Tv and Het/Hom ratio match against truth — rewards biologically consistent calls |
+
+SNP/INDEL weighting is truth-count-proportional: `(f1_snp x truth_total_snp + f1_indel x truth_total_indel) / total_truth`. There is no fixed-ratio fallback — a round with no truth totals at all is scored 0 rather than reweighted.
+
+### 5.2 Weight assignment (round-only winner-heavy pruning dust)
+
+- Each scored round is ranked from that round's normalized AdvancedScorer result only; historical scores do not carry into winner selection
+- Miners must participate in ≥ 5 of the last 20 rounds to be eligible for weights; the current round counts
+- Miners below the participation threshold receive 0 weight
+- Reward parameters come from `/scoring/network-config` — read the live values there. The shape is winner-heavy: the highest-scoring eligible current-round miner receives the `winner_weight` share, eligible ranks #2 through `dust_top_n` split the remainder as ranked pruning dust with `dust_decay` geometric decay, and `burn_rate` (plus any weight that cannot be assigned to an eligible miner) goes to burn
+- Close current-round ties use deterministic submission/canonical-ranking signals so validators converge on the same winner
+
+---
+
+## 6. Result Integrity
+
+| Mechanism | How it works |
+| --- | --- |
+| **Config re-execution** | Validators run the miner's tool independently, so a score comes from the validator's own run rather than from a submitted VCF |
+| **Synthetic mutations** | HelixForge inserts mutations at positions not published in advance, so a public truth set alone does not cover the round |
+| **Keypair authentication** | Every API call is signed with the Bittensor wallet keypair, so each submission is attributable to its hotkey |
+| **Infrastructure parameters** | `threads`, `memory_gb`, `timeout`, `ref_build`, `num_threads` are host-specific and are removed from submitted configs, so scoring compares quality parameters only |
+| **Winner-heavy rewards** | The top eligible miner receives the winner share (`winner_weight` in `/scoring/network-config`); eligible ranks below it receive pruning dust, so copied configs still need differentiated current-round performance |
+| **Round verification** | After a round closes, Minos publishes the round-selection record, the committed file hashes, and the released round files; miner commitment fields are included when that feature is enabled — see [docs/verification.md](verification.md) |
+
+---
+
+## 7. Repository Layout
+
+```text
+minos_subnet/
+├── neurons/
+│   ├── miner.py           # Miner loop: poll, download, call variants, submit config
+│   ├── validator.py       # Validator loop: subset scoring, set chain weights
+│   ├── status.py          # Health checks and system status
+│   └── README.md          # Neurons documentation
+├── templates/
+│   ├── gatk.py            # GATK HaplotypeCaller template
+│   ├── deepvariant.py     # Google DeepVariant template
+│   ├── freebayes.py       # FreeBayes template (DEPRECATED 2026-05-09)
+│   ├── bcftools.py        # BCFtools mpileup/call template
+│   ├── _common.py         # Shared template utilities
+│   └── tool_params.py     # Parameter definitions and validation
+├── utils/
+│   ├── scoring.py         # hap.py Docker runner + AdvancedScorer
+│   ├── weight_tracking.py # Round score tracker + winner-heavy pruning dust weights
+│   ├── platform_client.py # Authenticated API client (miner + validator)
+│   ├── subset_scoring.py  # Subset scoring helpers (assignments, deadlines)
+│   ├── config_loader.py   # Tool config file parser
+│   ├── path_utils.py      # Safe filesystem paths
+│   ├── file_utils.py      # File download + caching; SHA256 checked, with MINOS_ENFORCE_DOWNLOAD_SHA256 to reject a mismatching download
+│   └── README.md          # Utils documentation
+├── base/
+│   └── genomics_config.py # Central config (Docker images, timeouts, scoring params)
+├── configs/
+│   ├── gatk.conf          # Miner-tunable GATK quality parameters
+│   ├── deepvariant.conf   # Miner-tunable DeepVariant parameters
+│   ├── freebayes.conf     # Miner-tunable FreeBayes parameters (DEPRECATED 2026-05-09)
+│   └── bcftools.conf      # Miner-tunable BCFtools parameters
+├── docs/
+│   ├── architecture.md    # This document
+│   ├── tuning_guide.md    # Miner tuning reference (scoring, parameters, strategy)
+│   └── hap_py_docker.md   # hap.py Docker image reference
+├── scripts/
+│   ├── verify.sh          # Pre-flight environment check
+│   └── demo.sh            # End-to-end demo runner
+├── tests/                 # Unit and integration tests
+│   ├── conftest.py
+│   └── test_*.py          # Tests for scoring, config, platform client, etc.
+├── install.sh             # Installer (full setup or update mode)
+├── setup.py               # Interactive setup wizard
+├── start-miner.sh         # Start miner (with inline wallet setup)
+├── start-validator.sh     # Start validator (with inline wallet setup)
+├── pm2-miner.sh           # Start / restart miner under PM2
+├── pm2-validator.sh       # Start / restart validator under PM2
+├── ecosystem.miner.config.js     # PM2 config (miner)
+├── ecosystem.validator.config.js # PM2 config (validator)
+├── min_compute.yml        # Minimal compute requirements
+├── requirements.txt       # Python dependencies
+├── .env.miner.example     # Miner environment configuration
+└── .env.validator.example # Validator environment configuration
+```

@@ -23,6 +23,8 @@ def specs_to_space_json(specs: Mapping[str, ParamSpec]) -> Dict[str, Any]:
                 item["log"] = True
         if spec.kind == "categorical":
             item["choices"] = list(spec.choices or ())
+        if spec.note:
+            item["note"] = spec.note
         out[key] = item
     return out
 

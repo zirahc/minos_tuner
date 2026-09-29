@@ -3,15 +3,18 @@
   python -m tuner.fleet
 
 The agent chooses a search box, then Optuna fills a stack of trials
-(FLEET_BATCH). Each free VPS takes the next trial. A VPS that finishes
-takes another immediately. When the stack is empty, the tuner waits for
-the last running trial, then the agent builds the next stack.
+(FLEET_BATCH). Each trial first scores FLEET_ROUNDS practice rounds.
+The top quarter of that stack then scores the next FLEET_ROUNDS
+folders. Optuna is told after that check. A free VPS takes the next
+trial immediately. When the stack and its checks are done, the agent
+builds the next stack.
 
 Stop with Ctrl+C. GATK machines run: python main.py
 """
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -38,9 +41,10 @@ from tuner.jobs import (
     insert_pending_config,
     list_jobs_for_workers,
     list_queued,
+    requeue_confirmation,
 )
 from tuner.search_box import load_search_box, optuna_distributions
-from tuner.spaces import default_study_name
+from tuner.spaces import categories_touched, default_study_name
 from tuner.supabase_scores import fetch_config_scores
 
 DEFAULT_BOX = TUNER_ROOT / "search_box.json"
@@ -62,7 +66,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         flush=True,
     )
     print("   a free VPS takes the next trial from the stack", flush=True)
-    print("   the agent runs again after the last trial in the stack finishes", flush=True)
+    print(
+        f"   every trial scores {args.rounds} round(s); the top quarter then "
+        f"scores the next {args.rounds}",
+        flush=True,
+    )
+    print("   the agent runs again after those checks finish", flush=True)
     print("   GATK VPS: set WORKER_ID and run python main.py", flush=True)
     print("   stop with Ctrl+C", flush=True)
     try:
@@ -92,6 +101,7 @@ def run_once(args: argparse.Namespace, workers: List[str]) -> int:
         if queued is None or inflight is None:
             return 2
     watching = {str(job.get("id")): job for job in inflight if job.get("id")}
+    screened: Dict[str, Dict[str, Any]] = {}
     print(
         f"   stack={len(queued)}  running={len(watching)}",
         flush=True,
@@ -124,16 +134,30 @@ def run_once(args: argparse.Namespace, workers: List[str]) -> int:
             status = str((row or {}).get("status") or "")
             if status in TERMINAL:
                 score = (row or {}).get("avg_combined_final")
+                offset = int(job.get("rounds_offset") or (row or {}).get("rounds_offset") or 0)
                 print(
                     f"   worker={job.get('worker_id')} {status} "
-                    f"n_scored={(row or {}).get('n_scored')} avg={score}",
+                    f"n_scored={(row or {}).get('n_scored')} avg={score} offset={offset}",
                     flush=True,
                 )
+                if status == "scored" and offset <= 0:
+                    screened[config_id] = job
+                    continue
                 _tell_jobs([job])
                 continue
             still[config_id] = job
         watching = still
         if not watching and not queued:
+            if screened:
+                queued = _confirm_high_scores(screened, args.rounds)
+                screened = {}
+                if queued:
+                    print(
+                        f"   confirming {len(queued)} high score(s) on the next "
+                        f"{args.rounds} round(s)",
+                        flush=True,
+                    )
+                    continue
             print("   stack finished — agent will set the next trials", flush=True)
             return 0
         waiting = ",".join(str(job.get("worker_id")) for job in watching.values())
@@ -147,6 +171,48 @@ def run_once(args: argparse.Namespace, workers: List[str]) -> int:
             return 2
         assigned_ids = set(watching)
         queued = [row for row in refreshed if str(row.get("id") or "") not in assigned_ids]
+
+
+def _confirm_high_scores(
+    screened: Dict[str, Dict[str, Any]],
+    rounds: int,
+) -> List[Dict[str, Any]]:
+    """Requeue the top quarter to score the next practice folders.
+
+    The rest are told from the first screen. Optuna learns both.
+    """
+    ranked: List[tuple] = []
+    for config_id, job in screened.items():
+        row = fetch_score_row(config_id) or {}
+        try:
+            score = float(row.get("avg_combined_final"))
+        except (TypeError, ValueError):
+            _tell_jobs([job])
+            continue
+        ranked.append((score, config_id, job))
+    if not ranked:
+        return []
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    keep = max(1, math.ceil(len(ranked) * 0.25))
+    cutoff = ranked[keep - 1][0]
+    print(
+        f"   screen best={ranked[0][0]:.4f}  "
+        f"confirming {keep}/{len(ranked)} with avg>={cutoff:.4f}",
+        flush=True,
+    )
+    queued: List[Dict[str, Any]] = []
+    for score, config_id, job in ranked:
+        if len(queued) >= keep:
+            _tell_jobs([job])
+            continue
+        updated = requeue_confirmation(config_id, rounds)
+        if not updated:
+            print(f"   could not requeue {config_id}; telling the first screen", flush=True)
+            _tell_jobs([job])
+            continue
+        print(f"   confirm trial={job.get('optuna_trial_number')} avg={score:.4f}", flush=True)
+        queued.append(updated)
+    return queued
 
 
 def _build_stack(args: argparse.Namespace) -> bool:
@@ -172,11 +238,17 @@ def _build_stack(args: argparse.Namespace) -> bool:
     storage = (os.environ.get("OPTUNA_STORAGE") or DEFAULT_STORAGE).strip()
     distributions = optuna_distributions(box["space"], optuna)
     study = open_study(optuna, study_name, storage, reset=False)
-    history = fetch_config_scores(category=category, scored_only=True)
+    history = fetch_config_scores(category=None, scored_only=True)
     if history is None:
         return False
+    matched = [row for row in history if category in categories_touched(row)]
+    print(
+        f"   {category} experiments={len(matched)} "
+        f"(counted from the parameters each row set)",
+        flush=True,
+    )
     added, skipped = import_rows(
-        study, history, category, distributions, optuna, keys=list(box["space"])
+        study, matched, category, distributions, optuna, keys=list(box["space"])
     )
     print(f"   warm-start imported={added} skipped={skipped}", flush=True)
     _settle_running(study, study_name, TrialState)

@@ -32,7 +32,8 @@ try:
 except ImportError:
     pass
 
-from tuner.search_box import space_catalog, specs_to_space_json, validate_search_box, write_search_box
+from tuner.search_box import specs_to_space_json, validate_search_box, write_search_box
+from tuner.spaces import agent_reference, category_instruction
 from tuner.spaces import space_for
 from tuner.steps import multistep_search_box
 from tuner.supabase_scores import fetch_config_scores
@@ -53,6 +54,8 @@ Rules:
 - Open exactly one search_category from the catalog.
 - space keys must be a subset of that category. Do not add other GATK keys.
 - Bounds must stay inside the catalog low/high (or choices).
+- Each parameter note names the v2 metric it moves. The hypothesis must name that metric and the direction.
+- Search only keys in the chosen category.
 - n_trials is 4..8.
 - One category per round.
 - Failed / missing scores are not a GATK failure; ignore them for ranking.
@@ -74,7 +77,8 @@ category, choose the next category, tighten bounds around the best trials.
 
 Keep the draft unless the diagnosis shows a clear mistake.
 You may change search_category, space bounds, n_trials (4..8), hypothesis, or constraints.
-Stay inside the catalog. Do not add GATK keys. optimize must stay "avg_combined_final".
+Stay inside the catalog. Use each parameter note's v2 metric. The hypothesis must name that metric and the direction. Do not add keys from another category.
+optimize must stay "avg_combined_final".
 
 Return ONLY a JSON object with keys:
   search_category, hypothesis, space, constraints, n_trials, optimize
@@ -154,9 +158,9 @@ def heuristic_search_box(history: List[Dict[str, Any]]) -> Dict[str, Any]:
         and f1_snp is not None
         and f1_indel + 0.02 < f1_snp
     ):
-        category = "assembly"
+        category = "pcr"
         hypothesis = (
-            "INDEL F1 lags SNP F1. Search assembly before the deferred PCR indel model."
+            "INDEL F1 lags SNP F1. Search the PCR indel model before assembly."
         )
     elif not scored:
         category = "quality_filters"
@@ -208,6 +212,15 @@ def _compact_history(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return compact
 
 
+def _experiment_counts(report: Dict[str, Any]) -> str:
+    categories = report.get("categories") if isinstance(report.get("categories"), dict) else {}
+    return " ".join(
+        f"{name}={info.get('n')}"
+        for name, info in sorted(categories.items())
+        if isinstance(info, dict)
+    )
+
+
 def _print_report(report: Dict[str, Any]) -> None:
     best = report.get("best_avg_combined_final")
     best_txt = f"{best:.4f}" if isinstance(best, float) else "none"
@@ -217,6 +230,7 @@ def _print_report(report: Dict[str, Any]) -> None:
         for key in ("indel", "snp", "fp")
     )
     print(
+        f"   step 1 experiments: {_experiment_counts(report)}\n"
         f"   step 1 diagnose: bottleneck={report.get('bottleneck')} "
         f"best={best_txt} from {report.get('best_category')}  v2 loss {loss_txt}",
         flush=True,
@@ -227,7 +241,8 @@ def _print_report(report: Dict[str, Any]) -> None:
         flush=True,
     )
     print(
-        f"   step 3 choose: {report.get('choice')} ({report.get('reason')})",
+        f"   step 3 choose: {report.get('choice')} ({report.get('reason')})\n"
+        f"   step 3 note: {category_instruction(str(report.get('choice') or ''))}",
         flush=True,
     )
     print(
@@ -239,10 +254,13 @@ def _print_report(report: Dict[str, Any]) -> None:
 def _llm_review(report: Dict[str, Any], draft: Dict[str, Any]) -> Dict[str, Any]:
     user = json.dumps(
         {
-            "catalog": space_catalog(),
+            "catalog": agent_reference(),
             "diagnosis": report,
             "draft": draft,
-            "instruction": "Revise the draft only if the diagnosis shows a mistake. Return JSON only.",
+            "instruction": (
+                "Revise the draft only if the diagnosis or the parameter notes "
+                "show a mistake. Return JSON only."
+            ),
         },
         default=str,
     )
@@ -252,9 +270,12 @@ def _llm_review(report: Dict[str, Any], draft: Dict[str, Any]) -> Dict[str, Any]
 def _llm_search_box(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     return _parse_json_object(_chat(SYSTEM_PROMPT, json.dumps(
         {
-            "catalog": space_catalog(),
+            "catalog": agent_reference(),
             "history": history,
-            "instruction": "Choose the next search box from catalog + history. Return JSON only.",
+            "instruction": (
+                "Choose the next search box from the catalog notes and history. "
+                "Return JSON only."
+            ),
         },
         default=str,
     )))

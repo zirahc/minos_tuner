@@ -9,22 +9,36 @@ import math
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from tuner.search_box import specs_to_space_json
-from tuner.spaces import SPACES, ParamSpec, space_for
+from tuner.spaces import SPACES, ParamSpec, categories_touched, category_instruction, space_for
 from tuner.v2_score import component_losses
 
 # Order is the next lever for that limiter. A plateaued category is skipped.
 BOTTLENECK_PLAN: Dict[str, Tuple[str, ...]] = {
     "no_history": ("quality_filters",),
-    "false_positives": ("quality_filters", "downsampling", "pair_hmm"),
-    "indel": ("assembly", "pair_hmm", "priors"),
-    "sensitivity": ("active_region", "assembly", "priors", "quality_filters"),
+    "false_positives": (
+        "quality_filters",
+        "calling_confidence",
+        "pair_hmm",
+        "priors",
+        "downsampling",
+    ),
+    "indel": ("pcr", "assembly", "pair_hmm", "priors"),
+    "sensitivity": (
+        "active_region",
+        "calling_confidence",
+        "assembly",
+        "priors",
+        "quality_filters",
+    ),
     "broad": (
+        "pcr",
         "assembly",
         "active_region",
+        "calling_confidence",
         "priors",
         "pair_hmm",
-        "downsampling",
         "quality_filters",
+        "downsampling",
     ),
 }
 
@@ -89,7 +103,14 @@ def diagnose(history: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     losses = component_losses(metrics)
     bottleneck = _bottleneck(losses, has_scores=bool(scored))
     last = scored[-1] if scored else {}
-    last_category = last.get("search_category") if last.get("search_category") in SPACES else None
+    touched = categories_touched(last) if last else ()
+    stored = str(last.get("search_category") or "")
+    if stored in touched:
+        last_category = stored
+    elif touched:
+        last_category = touched[0]
+    else:
+        last_category = None
     return {
         "bottleneck": bottleneck,
         "n_scored": len(scored),
@@ -145,7 +166,8 @@ def _hypothesis(report: Mapping[str, Any], category: str, reason: str, bounds: s
     return (
         f"v2 point loss {_fmt_losses(report.get('losses'))}. "
         f"Bottleneck={report['bottleneck']} (best avg_combined_final={best_txt}). "
-        f"{reason}. Bounds={bounds}. Confirm or reject against the next scored rows."
+        f"{reason}. {category_instruction(category)} "
+        f"Bounds={bounds}. Confirm or reject against the next scored rows."
     )
 
 
@@ -366,12 +388,10 @@ def _by_category(
 ) -> Dict[str, List[Mapping[str, Any]]]:
     grouped: Dict[str, List[Mapping[str, Any]]] = {}
     for row in history:
-        name = row.get("search_category")
-        if name not in SPACES:
-            continue
         if _num(row.get("avg_combined_final")) is None:
             continue
-        grouped.setdefault(str(name), []).append(row)
+        for name in categories_touched(row):
+            grouped.setdefault(name, []).append(row)
     return grouped
 
 

@@ -73,6 +73,23 @@ def list_pending(limit: int = 1) -> List[Dict[str, Any]]:
     return data if isinstance(data, list) else []
 
 
+def requeue_confirmation(config_id: str, rounds_offset: int) -> Optional[Dict[str, Any]]:
+    """Send a high-scoring trial back out to score the next practice rounds."""
+    updated = rest_json(
+        "PATCH",
+        config_table(),
+        query=f"id=eq.{urllib.parse.quote(str(config_id), safe='')}",
+        body={
+            "status": "queued",
+            "worker_id": None,
+            "rounds_offset": int(rounds_offset),
+        },
+    )
+    if isinstance(updated, list) and updated and isinstance(updated[0], dict):
+        return updated[0]
+    return None
+
+
 def list_queued() -> Optional[List[Dict[str, Any]]]:
     """Trials waiting for a free VPS. main.py does not claim these."""
     query = "&".join([
