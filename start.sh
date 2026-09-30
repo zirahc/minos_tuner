@@ -161,12 +161,14 @@ print(f"set WORKER_ID={worker}")
 print(f"set MINOS_SUBNET={subnet}")
 PY
 
-PY="$SUBNET_DIR/.venv/bin/python"
-if [[ ! -x "$PY" ]]; then
-  echo "ERROR: $PY is missing. install.sh did not finish."
+if [[ ! -f "$SUBNET_DIR/.venv/bin/activate" ]]; then
+  echo "ERROR: $SUBNET_DIR/.venv is missing. install.sh did not finish."
   exit 1
 fi
 
+# shellcheck disable=SC1091
+source "$SUBNET_DIR/.venv/bin/activate"
 cd "$TUNER_DIR"
-"$PY" download_practice_samples.py --type "$CHR_TYPE"
-exec "$PY" main.py
+pip install -r requirements.txt
+python download_practice_samples.py --type "$CHR_TYPE"
+exec python main.py
