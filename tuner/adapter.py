@@ -200,9 +200,9 @@ def catalog_categorical_distributions(
     Int and float ranges may shrink. A categorical may not: Optuna raises
     ``CategoricalDistribution does not support dynamic value space``.
     """
-    from tuner.spaces import COMBO_CATEGORY
+    from tuner.spaces import is_agent_experiment
 
-    if category == COMBO_CATEGORY:
+    if is_agent_experiment(category):
         return dict(distributions)
     catalog = space_for(category)
     fixed = dict(distributions)

@@ -266,16 +266,20 @@ def known_categories() -> Tuple[str, ...]:
 
 
 def full_pass_category(row: Mapping[str, Any]) -> Optional[str]:
-    """Category varied on a full config. Partial old rows return None."""
+    """Category varied on a full config. Partial old rows return None.
+
+    A search_category outside the catalog is its own experiment. Combo is
+    one of those. It is counted under that name, not under a GATK category.
+    """
     updates = row.get("gatk_updates") if isinstance(row.get("gatk_updates"), dict) else {}
     found: List[str] = []
     for key in updates:
         for name, specs in SPACES.items():
             if key in specs and name not in found:
                 found.append(name)
-    stored = str(row.get("search_category") or "")
-    if stored == COMBO_CATEGORY:
-        return COMBO_CATEGORY
+    stored = str(row.get("search_category") or "").strip()
+    if stored and stored not in SPACES:
+        return stored
     if stored in SPACES and len(found) > 2:
         return stored
     return None
@@ -298,8 +302,8 @@ def categories_touched(row: Mapping[str, Any]) -> Tuple[str, ...]:
                 found.append(name)
     if found:
         return tuple(found)
-    stored = str(row.get("search_category") or "")
-    if stored in SPACES:
+    stored = str(row.get("search_category") or "").strip()
+    if stored:
         return (stored,)
     return ()
 
@@ -369,8 +373,22 @@ def default_study_name(category: str) -> str:
     return f"gatk-v2-{category}"
 
 
+def is_agent_experiment(category: str) -> bool:
+    """True for a new experiment name. Catalog categories stay in SPACES."""
+    name = str(category or "").strip()
+    return bool(name) and name not in SPACES
+
+
 def category_instruction(category: str) -> str:
-    return CATEGORY_GUIDE.get(category, "")
+    if category in CATEGORY_GUIDE:
+        return CATEGORY_GUIDE[category]
+    if str(category or "").startswith("v2_"):
+        return (
+            "New experiment chosen from the largest v2 loss and the history "
+            "settings that raised avg_combined_final. Other parameters stay "
+            "at the best config."
+        )
+    return ""
 
 
 def agent_reference() -> Dict[str, Any]:

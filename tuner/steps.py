@@ -10,14 +10,15 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from tuner.search_box import enough_trials, specs_to_space_json
 from tuner.spaces import (
-    COMBO_CATEGORY,
     SPACES,
+    coarse_step,
     ParamSpec,
     categories_touched,
     category_instruction,
     category_of,
     coerce_param,
     full_pass_category,
+    is_agent_experiment,
     space_for,
     spec_of,
 )
@@ -68,22 +69,21 @@ def multistep_search_box(
     """Return (search box, report). The box still needs validate_search_box."""
     report = diagnose(history)
     category, reason, mode = choose_category(report)
-    if mode == "combo":
-        space = _combo_space(history)
-        owners = {category_of(key) for key in space}
-        if len(owners) < 2:
+    if mode == "experiment":
+        built = _v2_experiment(history, report)
+        if built is None:
             mode = "stop"
             category = (report.get("visit_order") or ["quality_filters"])[0]
             reason = (
-                "no parameter from a second category moved the score by more than "
-                f"{MIN_GAIN:.2f}"
+                "no history setting moved avg_combined_final by more than "
+                f"{MIN_GAIN:.2f} on the remaining v2 loss"
             )
             space = specs_to_space_json(space_for(category))
         else:
-            category = COMBO_CATEGORY
-    scored = _rows_for_category(history, category) if mode != "combo" else []
+            category, space, reason = built
+    scored = _rows_for_category(history, category) if mode != "experiment" else []
     shrink = mode == "refine" and len(scored) >= SHRINK_MIN_TRIALS
-    if mode != "combo":
+    if mode != "experiment":
         space = _space_json(category, scored if shrink else [])
     if shrink and not _searchable(space):
         category, reason, mode = _next_searchable(report, category)
@@ -92,8 +92,8 @@ def multistep_search_box(
         space = _space_json(category, scored if shrink else [])
         if not _searchable(space):
             space = specs_to_space_json(space_for(category))
-    if category == COMBO_CATEGORY:
-        bounds = "coarse"
+    if is_agent_experiment(category):
+        bounds = "directed"
     else:
         bounds = "shrunk" if space != specs_to_space_json(space_for(category)) else "full"
     n_trials = enough_trials(space)
@@ -122,7 +122,13 @@ def diagnose(history: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     scored = [row for row in history if _num(row.get("avg_combined_final")) is not None]
     grouped = _by_category(scored)
     categories: Dict[str, Any] = {}
-    for name in SPACES:
+    # Catalog categories first. An agent experiment that is not one of those
+    # categories (combo, or a later name) is added as its own row.
+    names = list(SPACES)
+    for name in grouped:
+        if name not in SPACES:
+            names.append(name)
+    for name in names:
         rows = grouped.get(name, [])
         best = _best_score(rows)
         categories[name] = {
@@ -134,7 +140,7 @@ def diagnose(history: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     metrics = _metrics(best_row)
     losses = component_losses(metrics)
     bottleneck = _bottleneck(losses, has_scores=bool(scored))
-    full_passes = {name: 0 for name in SPACES}
+    full_passes = {name: 0 for name in names}
     for row in scored:
         passed = full_pass_category(row)
         if passed:
@@ -143,6 +149,7 @@ def diagnose(history: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     needs_screen = {
         name: _category_needs_screen(scored, name) for name in SPACES
     }
+    open_experiment = _open_v2_experiment(scored)
     last = scored[-1] if scored else {}
     touched = categories_touched(last) if last else ()
     stored = str(last.get("search_category") or "")
@@ -161,11 +168,12 @@ def diagnose(history: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         "losses": losses,
         "categories": categories,
         "last_category": last_category,
-        "last_state": categories[last_category]["state"] if last_category else None,
+        "last_state": (categories.get(last_category) or {}).get("state") if last_category else None,
         "last_hypothesis": (last.get("hypothesis") or "") if last else "",
         "full_passes": full_passes,
         "visit_order": visit,
         "needs_screen": needs_screen,
+        "open_experiment": open_experiment,
     }
 
 
@@ -186,6 +194,13 @@ def choose_category(report: Mapping[str, Any]) -> Tuple[str, str, str]:
             f"full-config pass starts at {first}; the other parameters stay at the best config",
             "explore",
         )
+    open_name = report.get("open_experiment")
+    if isinstance(open_name, str) and open_name.startswith("v2_"):
+        return (
+            open_name,
+            f"continue {open_name} until it has {EXHAUST_MIN_TRIALS} scores",
+            "experiment",
+        )
     needs = report.get("needs_screen") if isinstance(report.get("needs_screen"), dict) else {}
     for name in order:
         if needs.get(name):
@@ -195,18 +210,11 @@ def choose_category(report: Mapping[str, Any]) -> Tuple[str, str, str]:
                 f"keep the best config and vary {name} ({done} full-config scores so far)",
                 "explore",
             )
-    combo_rows = int(passes.get(COMBO_CATEGORY) or 0)
-    if combo_rows < EXHAUST_MIN_TRIALS:
-        return (
-            COMBO_CATEGORY,
-            "category screens are within "
-            f"{MIN_GAIN:.2f}; combine the parameters that move the score",
-            "combo",
-        )
     return (
         order[0],
-        f"combo did not beat the best by more than {MIN_GAIN:.2f}; not continuing a flat experiment",
-        "stop",
+        "category screens are done; the next experiment comes from the largest "
+        "v2 loss and the settings that raised avg_combined_final",
+        "experiment",
     )
 
 
@@ -252,40 +260,218 @@ def _category_needs_screen(
     return latest < str(best_row.get("created_at") or "")
 
 
-def _combo_space(history: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
-    """Parameters whose coarse values already separate scores by more than MIN_GAIN."""
-    ranked: List[Tuple[float, str]] = []
+def _v2_experiment(
+    history: Sequence[Mapping[str, Any]],
+    report: Mapping[str, Any],
+) -> Optional[Tuple[str, Dict[str, Any], str]]:
+    """A new experiment aimed at the largest v2 loss.
+
+    Parameters are catalog settings whose history values already separated
+    avg_combined_final. Numeric ranges sit on the side that scored higher.
+    """
+    open_name = _open_v2_experiment(history)
+    if open_name:
+        parsed = _keys_from_experiment(open_name)
+        if parsed:
+            loss, keys = parsed
+            space = _directed_space(history, keys)
+            if _searchable(space):
+                return (
+                    open_name,
+                    space,
+                    f"continue {open_name}; it is still the v2 experiment for {loss}",
+                )
+    ranked = _ranked_movers(history)
+    if not ranked:
+        return None
+    losses = report.get("losses") if isinstance(report.get("losses"), dict) else {}
+    for loss in _loss_priority(losses):
+        preferred = set(_loss_categories(loss))
+        ordered = [item for item in ranked if category_of(item[1]) in preferred]
+        ordered.extend(item for item in ranked if category_of(item[1]) not in preferred)
+        if not any(category_of(item[1]) in preferred for item in ordered):
+            continue
+        for start in range(len(ordered)):
+            picked = ordered[start : start + 4]
+            if not picked or not any(category_of(item[1]) in preferred for item in picked):
+                continue
+            keys = [item[1] for item in picked]
+            name = _experiment_name(loss, keys)
+            if _experiment_done(history, name):
+                continue
+            space = _directed_space(history, keys)
+            if not _searchable(space):
+                continue
+            return name, space, _experiment_reason(loss, losses.get(loss), picked)
+    return None
+
+
+def _loss_priority(losses: Mapping[str, Any]) -> List[str]:
+    named = []
+    for key in ("indel", "fp", "snp"):
+        value = losses.get(key)
+        if isinstance(value, float):
+            named.append((value, key))
+    named.sort(reverse=True)
+    order = [key for _value, key in named]
+    largest = losses.get("largest")
+    if isinstance(largest, str) and largest in order:
+        order.remove(largest)
+        order.insert(0, largest)
+    return order or ["indel", "fp", "snp"]
+
+
+def _loss_categories(loss: str) -> Tuple[str, ...]:
+    if loss == "fp":
+        return BOTTLENECK_PLAN["false_positives"]
+    if loss == "snp":
+        return BOTTLENECK_PLAN["sensitivity"]
+    return BOTTLENECK_PLAN["indel"]
+
+
+def _ranked_movers(
+    history: Sequence[Mapping[str, Any]],
+) -> List[Tuple[float, str, ParamSpec, Dict[str, List[float]]]]:
+    cache: Dict[str, set] = {}
+    ranked = []
     for specs in SPACES.values():
         for key, spec in specs.items():
-            spread = _param_spread(history, key, spec)
+            bins = _param_bins(history, key, spec, cache)
+            if len(bins) < 2:
+                continue
+            means = [_mean(values) for values in bins.values()]
+            spread = max(means) - min(means)
             if spread > MIN_GAIN:
-                ranked.append((spread, key))
-    ranked.sort(reverse=True)
-    picked = ranked[:6]
-    owners = {category_of(key) for _spread, key in picked}
-    if len(owners) < 2:
-        for _spread, key in ranked[6:]:
-            owner = category_of(key)
-            if owner not in owners:
-                picked.append((_spread, key))
-                owners.add(owner)
-                break
-    if len(owners) < 2:
-        return {}
-    if len(picked) > 6:
-        picked = picked[:5] + [picked[-1]]
-    specs = {key: spec_of(key) for _spread, key in picked}
-    specs = {key: spec for key, spec in specs.items() if spec is not None}
-    return specs_to_space_json(specs)
+                ranked.append((spread, key, spec, bins))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return ranked
 
 
-def _param_spread(
-    history: Sequence[Mapping[str, Any]], key: str, spec: ParamSpec
-) -> float:
+def _directed_space(
+    history: Sequence[Mapping[str, Any]], keys: Sequence[str]
+) -> Dict[str, Any]:
+    cache: Dict[str, set] = {}
+    specs: Dict[str, ParamSpec] = {}
+    bins_by_key: Dict[str, Dict[str, List[float]]] = {}
+    for key in keys:
+        spec = spec_of(key)
+        if spec is None:
+            continue
+        specs[key] = spec
+        bins_by_key[key] = _param_bins(history, key, spec, cache)
+    space = specs_to_space_json(specs)
+    for key, spec in specs.items():
+        space[key] = _directed_item(spec, bins_by_key.get(key) or {}, space[key])
+    return space
+
+
+def _directed_item(
+    spec: ParamSpec,
+    bins: Mapping[str, Sequence[float]],
+    full: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Keep the catalog grid, but drop the numeric side that scored worse."""
+    if spec.kind not in ("int", "float") or spec.log or spec.low is None or spec.high is None:
+        return full
+    if len(bins) < 2:
+        return full
+    means = {label: _mean(values) for label, values in bins.items() if values}
+    if len(means) < 2:
+        return full
+    winner_label = max(means, key=lambda label: means[label])
+    winner_mean = means[winner_label]
+    kept = [
+        float(label)
+        for label, mean in means.items()
+        if mean + MIN_GAIN >= winner_mean
+    ]
+    if not kept:
+        return full
+    low = min(kept)
+    high = max(kept)
+    catalog_low = float(spec.low)
+    catalog_high = float(spec.high)
+    step = coarse_step(spec) or 0.0
+    if high <= low and step > 0:
+        winner = float(winner_label)
+        if winner <= catalog_low:
+            low, high = winner, min(catalog_high, winner + step)
+        elif winner >= catalog_high:
+            low, high = max(catalog_low, winner - step), winner
+        else:
+            low, high = max(catalog_low, winner - step), min(catalog_high, winner + step)
+    low = max(catalog_low, low)
+    high = min(catalog_high, high)
+    if high < low:
+        return full
+    item = dict(full)
+    if spec.kind == "int":
+        item["low"] = int(round(low))
+        item["high"] = int(round(high))
+    else:
+        item["low"] = _round_float(low)
+        item["high"] = _round_float(high)
+    return item
+
+
+def _experiment_name(loss: str, keys: Sequence[str]) -> str:
+    return "v2_" + loss + "__" + "__".join(keys)
+
+
+def _keys_from_experiment(name: str) -> Optional[Tuple[str, Tuple[str, ...]]]:
+    if not name.startswith("v2_") or "__" not in name:
+        return None
+    loss, _, tail = name[3:].partition("__")
+    keys = tuple(part for part in tail.split("__") if part and spec_of(part) is not None)
+    if not loss or not keys:
+        return None
+    return loss, keys
+
+
+def _open_v2_experiment(history: Sequence[Mapping[str, Any]]) -> Optional[str]:
+    for row in reversed(list(history)):
+        name = str(row.get("search_category") or "").strip()
+        if not name.startswith("v2_"):
+            continue
+        if _experiment_done(history, name):
+            return None
+        return name
+    return None
+
+
+def _experiment_done(history: Sequence[Mapping[str, Any]], name: str) -> bool:
+    rows = [
+        row for row in history
+        if str(row.get("search_category") or "").strip() == name
+        and _num(row.get("avg_combined_final")) is not None
+    ]
+    return len(rows) >= EXHAUST_MIN_TRIALS
+
+
+def _experiment_reason(loss: str, loss_value: Any, picked: Sequence[Tuple[Any, ...]]) -> str:
+    amount = f"{loss_value:.4f}" if isinstance(loss_value, float) else "na"
+    directions = []
+    for spread, key, _spec, bins in picked:
+        means = {label: _mean(scores) for label, scores in bins.items() if scores}
+        winner = max(means, key=lambda label: means[label]) if means else "?"
+        directions.append(f"{key} toward {winner} (spread {spread:.4f})")
+    return (
+        f"v2 {loss} loss is {amount}. History raised avg_combined_final with "
+        + "; ".join(directions)
+        + ". This experiment varies those settings."
+    )
+
+
+def _param_bins(
+    history: Sequence[Mapping[str, Any]],
+    key: str,
+    spec: ParamSpec,
+    cache: Dict[str, set],
+) -> Dict[str, List[float]]:
+    owner = category_of(key)
     bins: Dict[str, List[float]] = {}
     for row in history:
-        owner = category_of(key)
-        if owner and owner not in categories_touched(row) and full_pass_category(row) != COMBO_CATEGORY:
+        if not _row_informs_param(history, row, key, owner, cache):
             continue
         updates = row.get("gatk_updates") if isinstance(row.get("gatk_updates"), dict) else {}
         config = row.get("gatk_config") if isinstance(row.get("gatk_config"), dict) else {}
@@ -300,10 +486,48 @@ def _param_spread(
         if score is None:
             continue
         bins.setdefault(str(snapped), []).append(score)
-    if len(bins) < 2:
-        return 0.0
-    means = [sum(values) / len(values) for values in bins.values()]
-    return max(means) - min(means)
+    return bins
+
+
+def _row_informs_param(
+    history: Sequence[Mapping[str, Any]],
+    row: Mapping[str, Any],
+    key: str,
+    owner: Optional[str],
+    cache: Dict[str, set],
+) -> bool:
+    """Use a row only when this key was part of the experiment, not a held base value."""
+    passed = full_pass_category(row)
+    if passed in SPACES:
+        return passed == owner
+    if passed:
+        named = _keys_from_experiment(passed)
+        if named is not None:
+            return key in named[1]
+        return key in _varied_keys(history, passed, cache)
+    return bool(owner) and owner in categories_touched(row)
+
+
+def _varied_keys(
+    history: Sequence[Mapping[str, Any]], name: str, cache: Dict[str, set]
+) -> set:
+    if name in cache:
+        return cache[name]
+    grouped: Dict[str, set] = {}
+    for row in history:
+        if str(row.get("search_category") or "").strip() != name:
+            continue
+        updates = row.get("gatk_updates") if isinstance(row.get("gatk_updates"), dict) else {}
+        config = row.get("gatk_config") if isinstance(row.get("gatk_config"), dict) else {}
+        source = updates or config
+        for param, raw in source.items():
+            grouped.setdefault(str(param), set()).add(str(raw))
+    cache[name] = {param for param, values in grouped.items() if len(values) > 1}
+    return cache[name]
+
+
+def _mean(values: Sequence[float]) -> float:
+    return sum(values) / len(values)
 
 
 def _rows_for_category(

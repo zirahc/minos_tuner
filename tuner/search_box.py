@@ -8,6 +8,7 @@ from typing import Any, Dict, Mapping
 from tuner.spaces import (
     COMBO_CATEGORY,
     SPACES,
+    is_agent_experiment,
     ParamSpec,
     category_of,
     coarse_levels,
@@ -55,7 +56,7 @@ def validate_search_box(raw: Mapping[str, Any]) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("search box must be a JSON object")
     category = str(raw.get("search_category") or "").strip()
-    if category not in SPACES and category != COMBO_CATEGORY:
+    if category not in SPACES and not is_agent_experiment(category):
         raise ValueError(
             f"search_category must be one of: {', '.join(known_categories())}, {COMBO_CATEGORY}"
         )
@@ -77,7 +78,7 @@ def validate_search_box(raw: Mapping[str, Any]) -> Dict[str, Any]:
     space_out: Dict[str, Any] = {}
     seen_categories = set()
     for key, spec_in in space_in.items():
-        if category == COMBO_CATEGORY:
+        if is_agent_experiment(category):
             allowed_spec = spec_of(str(key))
             owner = category_of(str(key))
             if allowed_spec is None or owner is None:

@@ -55,7 +55,7 @@ from tuner.jobs import (
     requeue_confirmation,
 )
 from tuner.search_box import MAX_TRIALS, load_search_box, optuna_distributions
-from tuner.spaces import COMBO_CATEGORY, best_base_updates, categories_touched, default_study_name
+from tuner.spaces import best_base_updates, categories_touched, default_study_name, is_agent_experiment
 from tuner.steps import MIN_GAIN
 from tuner.supabase_scores import fetch_config_scores
 
@@ -334,11 +334,11 @@ def _build_stack(args: argparse.Namespace) -> bool:
     history = fetch_config_scores(category=None, scored_only=True)
     if history is None:
         return False
-    if category == COMBO_CATEGORY:
+    if is_agent_experiment(category):
         print(
-            "   combo: varying "
+            f"   {category}: varying "
             + ", ".join(box["space"])
-            + " across categories; other parameters stay at the best config",
+            + "; other parameters stay at the best config",
             flush=True,
         )
         added, skipped = 0, 0
