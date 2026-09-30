@@ -7,8 +7,9 @@ so they stay at the GATK default and are not searched.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 Kind = str  # "int" | "float" | "categorical"
 
@@ -62,9 +63,15 @@ CATEGORY_GUIDE: Dict[str, str] = {
         "Moves core F1 where coverage is high. A lower cap drops reads that "
         "start at the same position. The floor is 25, so downsampling stays on."
     ),
+    "combo": (
+        "Varies only parameters that already moved avg_combined_final, "
+        "including parameters from different categories. The rest stay at the best config."
+    ),
 }
 
 DEFERRED: Tuple[Dict[str, str], ...] = ()
+# Cross-category experiment. Not a GATK parameter group.
+COMBO_CATEGORY = "combo"
 
 
 SPACES: Dict[str, Dict[str, ParamSpec]] = {
@@ -258,12 +265,31 @@ def known_categories() -> Tuple[str, ...]:
     return tuple(sorted(SPACES))
 
 
+def full_pass_category(row: Mapping[str, Any]) -> Optional[str]:
+    """Category varied on a full config. Partial old rows return None."""
+    updates = row.get("gatk_updates") if isinstance(row.get("gatk_updates"), dict) else {}
+    found: List[str] = []
+    for key in updates:
+        for name, specs in SPACES.items():
+            if key in specs and name not in found:
+                found.append(name)
+    stored = str(row.get("search_category") or "")
+    if stored == COMBO_CATEGORY:
+        return COMBO_CATEGORY
+    if stored in SPACES and len(found) > 2:
+        return stored
+    return None
+
+
 def categories_touched(row: Mapping[str, Any]) -> Tuple[str, ...]:
     """Current categories an experiment belongs to.
 
-    Older rows keep the category name from before calling confidence was
-    split out. The keys in gatk_updates decide the count now.
+    A full-config row counts only as the category it varied. Older rows
+    that set a few keys are counted from those keys.
     """
+    passed = full_pass_category(row)
+    if passed:
+        return (passed,)
     updates = row.get("gatk_updates") if isinstance(row.get("gatk_updates"), dict) else {}
     found: List[str] = []
     for key in updates:
@@ -276,6 +302,60 @@ def categories_touched(row: Mapping[str, Any]) -> Tuple[str, ...]:
     if stored in SPACES:
         return (stored,)
     return ()
+
+
+def catalog_defaults() -> Dict[str, Any]:
+    params: Dict[str, Any] = {}
+    for specs in SPACES.values():
+        for key, spec in specs.items():
+            params[key] = spec.default
+    return params
+
+
+def full_params_from_row(row: Mapping[str, Any]) -> Dict[str, Any]:
+    """Every catalog parameter on the config that was actually scored.
+
+    gatk_updates wins, then gatk_config, then the catalog default.
+    Keys outside the catalog are copied from gatk_config so the file matches that run.
+    """
+    updates = row.get("gatk_updates") if isinstance(row.get("gatk_updates"), dict) else {}
+    config = row.get("gatk_config") if isinstance(row.get("gatk_config"), dict) else {}
+    params = catalog_defaults()
+    for key, value in config.items():
+        if key not in params:
+            params[key] = value
+    for specs in SPACES.values():
+        for key, spec in specs.items():
+            if key in updates:
+                raw = updates[key]
+            elif key in config:
+                raw = config[key]
+            else:
+                continue
+            try:
+                params[key] = coerce_param(spec, raw)
+            except (TypeError, ValueError):
+                params[key] = spec.default
+    return params
+
+
+def best_base_updates(
+    rows: Sequence[Mapping[str, Any]],
+) -> Tuple[Dict[str, Any], Optional[Mapping[str, Any]]]:
+    """Full parameter set from the highest avg_combined_final row."""
+    best_row: Optional[Mapping[str, Any]] = None
+    best_score: Optional[float] = None
+    for row in rows:
+        try:
+            score = float(row.get("avg_combined_final"))
+        except (TypeError, ValueError):
+            continue
+        if best_score is None or score > best_score:
+            best_score = score
+            best_row = row
+    if best_row is None:
+        return catalog_defaults(), None
+    return full_params_from_row(best_row), best_row
 
 
 def space_for(category: str) -> Dict[str, ParamSpec]:
@@ -324,22 +404,115 @@ def _spec_note(spec: ParamSpec) -> Dict[str, Any]:
     return item
 
 
+def coarse_step(spec: ParamSpec) -> Optional[float]:
+    """Large step for the first search. A step of 1 or 2 is not used on a wide range.
+
+    standard_min_confidence_threshold_for_calling is 30, 40, 50, ... not 32, 34, 36.
+    """
+    if spec.kind not in ("int", "float") or spec.log:
+        return None
+    if spec.low is None or spec.high is None:
+        return None
+    span = float(spec.high) - float(spec.low)
+    if span <= 0:
+        return None
+    if spec.kind == "float" and span >= 50:
+        return 10.0
+    target = span / 4
+    nice = (2, 4, 5, 10, 15, 20, 25, 30, 40, 50, 100)
+    if spec.kind == "int":
+        target = max(2.0, target)
+        if span >= 20:
+            target = max(target, 5.0)
+        if span >= 40:
+            target = max(target, 10.0)
+        step = min(nice, key=lambda item: (abs(item - target), -item))
+        while step > span / 2 and step > 2:
+            smaller = [item for item in nice if item < step]
+            if not smaller:
+                break
+            step = smaller[-1]
+        return float(int(step))
+    return float(target)
+
+
+def coarse_levels(spec: ParamSpec) -> Optional[Tuple[float, ...]]:
+    """Four log-spaced levels. Adjacent floats on a log range are not separate trials."""
+    if not spec.log or spec.low is None or spec.high is None:
+        return None
+    low = float(spec.low)
+    high = float(spec.high)
+    if low <= 0 or high <= low:
+        return None
+    levels: List[float] = []
+    for index in range(4):
+        weight = index / 3
+        value = math.exp(math.log(low) + weight * (math.log(high) - math.log(low)))
+        levels.append(_round_sig(value))
+    ordered: List[float] = []
+    for value in levels:
+        if value not in ordered:
+            ordered.append(value)
+    return tuple(ordered)
+
+
+def spec_of(key: str) -> Optional[ParamSpec]:
+    for specs in SPACES.values():
+        if key in specs:
+            return specs[key]
+    return None
+
+
+def category_of(key: str) -> Optional[str]:
+    for name, specs in SPACES.items():
+        if key in specs:
+            return name
+    return None
+
+
+def snap_to_grid(spec: ParamSpec, value: float) -> Any:
+    levels = coarse_levels(spec)
+    if levels:
+        def distance(level: float) -> float:
+            return abs(math.log(max(level, 1e-12)) - math.log(max(value, 1e-12)))
+        return min(levels, key=distance)
+    step = coarse_step(spec)
+    if step is None or spec.low is None or spec.high is None:
+        return int(round(value)) if spec.kind == "int" else float(value)
+    low = float(spec.low)
+    high = float(spec.high)
+    max_n = int(math.floor((high - low) / step + 1e-9))
+    n = int(round((value - low) / step))
+    n = max(0, min(max_n, n))
+    snapped = low + n * step
+    if spec.kind == "int":
+        return int(round(snapped))
+    return float(snapped)
+
+
+def _round_sig(value: float) -> float:
+    if value == 0:
+        return 0.0
+    digits = math.floor(math.log10(abs(value)))
+    return round(value, -int(digits))
+
+
 def coerce_param(spec: ParamSpec, raw: Any) -> Any:
-    """Map a stored gatk_config value onto the Optuna type for this spec."""
+    """Map a stored gatk_config value onto the coarse Optuna grid for this spec."""
     if spec.kind == "int":
         value = int(round(float(raw)))
         if spec.low is not None:
             value = max(int(spec.low), value)
         if spec.high is not None:
             value = min(int(spec.high), value)
-        return value
+        return snap_to_grid(spec, float(value))
     if spec.kind == "float":
         value = float(raw)
         if spec.low is not None:
             value = max(float(spec.low), value)
         if spec.high is not None:
             value = min(float(spec.high), value)
-        return value
+        return snap_to_grid(spec, value)
     if spec.kind == "categorical":
         choices = spec.choices or ()
         if isinstance(raw, str) and raw.lower() in ("true", "false"):

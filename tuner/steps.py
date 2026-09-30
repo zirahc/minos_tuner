@@ -9,7 +9,18 @@ import math
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from tuner.search_box import specs_to_space_json
-from tuner.spaces import SPACES, ParamSpec, categories_touched, category_instruction, space_for
+from tuner.spaces import (
+    COMBO_CATEGORY,
+    SPACES,
+    ParamSpec,
+    categories_touched,
+    category_instruction,
+    category_of,
+    coerce_param,
+    full_pass_category,
+    space_for,
+    spec_of,
+)
 from tuner.v2_score import component_losses
 
 # Order is the next lever for that limiter. A plateaued category is skipped.
@@ -42,7 +53,10 @@ BOTTLENECK_PLAN: Dict[str, Tuple[str, ...]] = {
     ),
 }
 
-IMPROVE_MARGIN = 0.0015
+# A category that does not beat the current best by more than this
+# is not given more trials. The first goal is to move 0.75 toward 0.9.
+MIN_GAIN = 0.01
+IMPROVE_MARGIN = MIN_GAIN
 EXHAUST_MIN_TRIALS = 4
 SHRINK_MIN_TRIALS = 3
 TOP_K = 3
@@ -54,17 +68,34 @@ def multistep_search_box(
     """Return (search box, report). The box still needs validate_search_box."""
     report = diagnose(history)
     category, reason, mode = choose_category(report)
-    scored = _by_category(history).get(category, [])
+    if mode == "combo":
+        space = _combo_space(history)
+        owners = {category_of(key) for key in space}
+        if len(owners) < 2:
+            mode = "stop"
+            category = (report.get("visit_order") or ["quality_filters"])[0]
+            reason = (
+                "no parameter from a second category moved the score by more than "
+                f"{MIN_GAIN:.2f}"
+            )
+            space = specs_to_space_json(space_for(category))
+        else:
+            category = COMBO_CATEGORY
+    scored = _rows_for_category(history, category) if mode != "combo" else []
     shrink = mode == "refine" and len(scored) >= SHRINK_MIN_TRIALS
-    space = _space_json(category, scored if shrink else [])
+    if mode != "combo":
+        space = _space_json(category, scored if shrink else [])
     if shrink and not _searchable(space):
         category, reason, mode = _next_searchable(report, category)
-        scored = _by_category(history).get(category, [])
+        scored = _rows_for_category(history, category)
         shrink = mode == "refine" and len(scored) >= SHRINK_MIN_TRIALS
         space = _space_json(category, scored if shrink else [])
         if not _searchable(space):
             space = specs_to_space_json(space_for(category))
-    bounds = "shrunk" if space != specs_to_space_json(space_for(category)) else "full"
+    if category == COMBO_CATEGORY:
+        bounds = "coarse"
+    else:
+        bounds = "shrunk" if space != specs_to_space_json(space_for(category)) else "full"
     n_trials = 4 if bounds == "shrunk" else 6
     hypothesis = _hypothesis(report, category, reason, bounds)
     report.update({
@@ -82,6 +113,7 @@ def multistep_search_box(
         "constraints": _constraints(report),
         "n_trials": n_trials,
         "optimize": "avg_combined_final",
+        "run_experiment": mode != "stop",
     }
     return box, report
 
@@ -102,6 +134,15 @@ def diagnose(history: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     metrics = _metrics(best_row)
     losses = component_losses(metrics)
     bottleneck = _bottleneck(losses, has_scores=bool(scored))
+    full_passes = {name: 0 for name in SPACES}
+    for row in scored:
+        passed = full_pass_category(row)
+        if passed:
+            full_passes[passed] = full_passes.get(passed, 0) + 1
+    visit = _visit_order(bottleneck)
+    needs_screen = {
+        name: _category_needs_screen(scored, name) for name in SPACES
+    }
     last = scored[-1] if scored else {}
     touched = categories_touched(last) if last else ()
     stored = str(last.get("search_category") or "")
@@ -122,42 +163,156 @@ def diagnose(history: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         "last_category": last_category,
         "last_state": categories[last_category]["state"] if last_category else None,
         "last_hypothesis": (last.get("hypothesis") or "") if last else "",
+        "full_passes": full_passes,
+        "visit_order": visit,
+        "needs_screen": needs_screen,
     }
 
 
 def choose_category(report: Mapping[str, Any]) -> Tuple[str, str, str]:
-    """Return (category, reason, mode). mode is explore or refine."""
-    categories: Mapping[str, Any] = report["categories"]
-    last = report.get("last_category")
-    last_state = report.get("last_state")
-    if report["bottleneck"] == "no_history" or not last:
-        return "quality_filters", "no scored history; start with quality filters", "explore"
-    if last_state in ("improving", "partial"):
-        mode = "refine" if last_state == "improving" else "explore"
-        return last, f"{last} is {last_state}; keep searching it", mode
+    """One category per stack, on top of the best full config.
 
-    plan = BOTTLENECK_PLAN[report["bottleneck"]]
-    for name in plan:
-        state = categories[name]["state"]
-        if state in ("untried", "partial", "improving"):
-            mode = "refine" if state == "improving" else "explore"
+    A stack varies one category. The other parameters stay at the best
+    scored values. After that category has a full-config stack, the next
+    category in the visit order is opened. Old rows that changed only a
+    few keys do not count as that pass.
+    """
+    order = list(report.get("visit_order") or _visit_order(str(report.get("bottleneck") or "broad")))
+    passes = report.get("full_passes") if isinstance(report.get("full_passes"), dict) else {}
+    if report.get("bottleneck") == "no_history" or not any(int(passes.get(name) or 0) for name in order):
+        first = order[0]
+        return (
+            first,
+            f"full-config pass starts at {first}; the other parameters stay at the best config",
+            "explore",
+        )
+    needs = report.get("needs_screen") if isinstance(report.get("needs_screen"), dict) else {}
+    for name in order:
+        if needs.get(name):
+            done = int(passes.get(name) or 0)
             return (
                 name,
-                f"{report['bottleneck']} limiter; {last} plateaued, next is {name} ({state})",
-                mode,
+                f"keep the best config and vary {name} ({done} full-config scores so far)",
+                "explore",
             )
-
-    ranked = sorted(
-        plan,
-        key=lambda name: categories[name]["best"] if categories[name]["best"] is not None else -1.0,
-        reverse=True,
-    )
-    winner = ranked[0]
+    combo_rows = int(passes.get(COMBO_CATEGORY) or 0)
+    if combo_rows < EXHAUST_MIN_TRIALS:
+        return (
+            COMBO_CATEGORY,
+            "category screens are within "
+            f"{MIN_GAIN:.2f}; combine the parameters that move the score",
+            "combo",
+        )
     return (
-        winner,
-        f"every {report['bottleneck']} category plateaued; refine the best, {winner}",
-        "refine",
+        order[0],
+        f"combo did not beat the best by more than {MIN_GAIN:.2f}; not continuing a flat experiment",
+        "stop",
     )
+
+
+def _visit_order(bottleneck: str) -> List[str]:
+    """Limiter categories first, then every remaining catalog category."""
+    plan = list(BOTTLENECK_PLAN.get(bottleneck) or BOTTLENECK_PLAN["broad"])
+    for name in SPACES:
+        if name not in plan:
+            plan.append(name)
+    return plan
+
+
+def _category_needs_screen(
+    history: Sequence[Mapping[str, Any]], category: str
+) -> bool:
+    """True until this category has a screen, or the best config changed under it.
+
+    A finished screen within MIN_GAIN of the best does not get more trials.
+    It is tried again only after another category raises the best by more than MIN_GAIN.
+    """
+    full = [
+        row for row in history
+        if full_pass_category(row) == category and _num(row.get("avg_combined_final")) is not None
+    ]
+    if len(full) < EXHAUST_MIN_TRIALS:
+        return True
+    cat_best = _best_score(full)
+    prior_scores = [
+        score for row in history
+        if full_pass_category(row) != category
+        for score in [_num(row.get("avg_combined_final"))]
+        if score is not None
+    ]
+    prior = max(prior_scores) if prior_scores else None
+    if cat_best is None:
+        return True
+    if prior is None or cat_best + MIN_GAIN >= prior:
+        return False
+    best_row = _best_row(history)
+    if best_row is None or full_pass_category(best_row) == category:
+        return False
+    latest = max(str(row.get("created_at") or "") for row in full)
+    return latest < str(best_row.get("created_at") or "")
+
+
+def _combo_space(history: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Parameters whose coarse values already separate scores by more than MIN_GAIN."""
+    ranked: List[Tuple[float, str]] = []
+    for specs in SPACES.values():
+        for key, spec in specs.items():
+            spread = _param_spread(history, key, spec)
+            if spread > MIN_GAIN:
+                ranked.append((spread, key))
+    ranked.sort(reverse=True)
+    picked = ranked[:6]
+    owners = {category_of(key) for _spread, key in picked}
+    if len(owners) < 2:
+        for _spread, key in ranked[6:]:
+            owner = category_of(key)
+            if owner not in owners:
+                picked.append((_spread, key))
+                owners.add(owner)
+                break
+    if len(owners) < 2:
+        return {}
+    if len(picked) > 6:
+        picked = picked[:5] + [picked[-1]]
+    specs = {key: spec_of(key) for _spread, key in picked}
+    specs = {key: spec for key, spec in specs.items() if spec is not None}
+    return specs_to_space_json(specs)
+
+
+def _param_spread(
+    history: Sequence[Mapping[str, Any]], key: str, spec: ParamSpec
+) -> float:
+    bins: Dict[str, List[float]] = {}
+    for row in history:
+        owner = category_of(key)
+        if owner and owner not in categories_touched(row) and full_pass_category(row) != COMBO_CATEGORY:
+            continue
+        updates = row.get("gatk_updates") if isinstance(row.get("gatk_updates"), dict) else {}
+        config = row.get("gatk_config") if isinstance(row.get("gatk_config"), dict) else {}
+        if key not in updates and key not in config:
+            continue
+        raw = updates[key] if key in updates else config[key]
+        try:
+            snapped = coerce_param(spec, raw)
+        except (TypeError, ValueError):
+            continue
+        score = _num(row.get("avg_combined_final"))
+        if score is None:
+            continue
+        bins.setdefault(str(snapped), []).append(score)
+    if len(bins) < 2:
+        return 0.0
+    means = [sum(values) / len(values) for values in bins.values()]
+    return max(means) - min(means)
+
+
+def _rows_for_category(
+    history: Sequence[Mapping[str, Any]], category: str
+) -> List[Mapping[str, Any]]:
+    full = [row for row in history if full_pass_category(row) == category]
+    if full:
+        return full
+    return _by_category(history).get(category, [])
 
 
 def _hypothesis(report: Mapping[str, Any], category: str, reason: str, bounds: str) -> str:
@@ -222,18 +377,16 @@ def _category_state(rows: Sequence[Mapping[str, Any]]) -> str:
 
 
 def _next_searchable(report: Mapping[str, Any], blocked: str) -> Tuple[str, str, str]:
-    plan = BOTTLENECK_PLAN[str(report["bottleneck"])]
-    categories: Mapping[str, Any] = report["categories"]
-    for name in plan:
+    order = list(report.get("visit_order") or _visit_order(str(report.get("bottleneck") or "broad")))
+    passes = report.get("full_passes") if isinstance(report.get("full_passes"), dict) else {}
+    for name in order:
         if name == blocked:
             continue
-        state = categories[name]["state"]
-        if state in ("untried", "partial", "improving"):
-            mode = "refine" if state == "improving" else "explore"
-            return name, f"{blocked} has no room left; next is {name} ({state})", mode
-    for name in plan:
+        if int(passes.get(name) or 0) < EXHAUST_MIN_TRIALS:
+            return name, f"{blocked} has no room left; next is {name}", "explore"
+    for name in order:
         if name != blocked:
-            return name, f"{blocked} has no room left; refine {name}", "refine"
+            return name, f"{blocked} has no room left; vary {name} again on the best config", "refine"
     return blocked, f"{blocked} has no room left; reopen the full catalog", "explore"
 
 

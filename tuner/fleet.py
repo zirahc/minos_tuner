@@ -2,8 +2,9 @@
 
   python -m tuner.fleet
 
-The agent chooses a search box, then Optuna fills a stack of trials
-(FLEET_BATCH). Each trial first scores FLEET_ROUNDS practice rounds.
+The agent chooses one category to vary. Each trial writes every catalog
+parameter: the best scored config, with that category's new values on top.
+Each trial first scores FLEET_ROUNDS practice rounds.
 The top quarter of that stack then scores the next FLEET_ROUNDS
 folders. Optuna is told after that check. A free VPS takes the next
 trial immediately. When the stack and its checks are done, the agent
@@ -50,11 +51,14 @@ from tuner.jobs import (
     requeue_confirmation,
 )
 from tuner.search_box import load_search_box, optuna_distributions
-from tuner.spaces import categories_touched, default_study_name
+from tuner.spaces import COMBO_CATEGORY, best_base_updates, categories_touched, default_study_name
+from tuner.steps import MIN_GAIN
 from tuner.supabase_scores import fetch_config_scores
 
 DEFAULT_BOX = TUNER_ROOT / "search_box.json"
 TERMINAL = ("scored", "failed")
+# One category screen. A larger batch keeps sampling a flat region.
+SCREEN_TRIALS = 8
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -187,9 +191,9 @@ def _confirm_high_scores(
     screened: Dict[str, Dict[str, Any]],
     rounds: int,
 ) -> List[Dict[str, Any]]:
-    """Requeue the top quarter to score the next practice folders.
+    """Confirm only a screen that beats the current best by more than MIN_GAIN.
 
-    The rest are told from the first screen. Optuna learns both.
+    A gap of 0.01 or less is told from the first rounds and the category ends.
     """
     ranked: List[tuple] = []
     for config_id, job in screened.items():
@@ -203,16 +207,33 @@ def _confirm_high_scores(
     if not ranked:
         return []
     ranked.sort(key=lambda item: item[0], reverse=True)
+    baseline = _baseline_score(set(screened))
+    best = ranked[0][0]
+    if baseline is not None and best <= baseline + MIN_GAIN:
+        print(
+            f"   screen best={best:.4f} is within {MIN_GAIN:.2f} of {baseline:.4f}; "
+            "not continuing this experiment",
+            flush=True,
+        )
+        for _score, _config_id, job in ranked:
+            _tell_jobs([job])
+        return []
+    raised = [
+        item for item in ranked
+        if baseline is None or item[0] > baseline + MIN_GAIN
+    ]
     keep = max(1, math.ceil(len(ranked) * 0.25))
-    cutoff = ranked[keep - 1][0]
+    raised = raised[:keep]
+    base_txt = f"{baseline:.4f}" if baseline is not None else "none"
     print(
-        f"   screen best={ranked[0][0]:.4f}  "
-        f"confirming {keep}/{len(ranked)} with avg>={cutoff:.4f}",
+        f"   screen best={best:.4f} beats {base_txt} by more than {MIN_GAIN:.2f}; "
+        f"confirming {len(raised)} trial(s)",
         flush=True,
     )
     queued: List[Dict[str, Any]] = []
+    confirm_ids = {config_id for _score, config_id, _job in raised}
     for score, config_id, job in ranked:
-        if len(queued) >= keep:
+        if config_id not in confirm_ids:
             _tell_jobs([job])
             continue
         updated = requeue_confirmation(config_id, rounds)
@@ -223,6 +244,26 @@ def _confirm_high_scores(
         print(f"   confirm trial={job.get('optuna_trial_number')} avg={score:.4f}", flush=True)
         queued.append(updated)
     return queued
+
+
+def _baseline_score(exclude: set) -> Optional[float]:
+    """Best avg_combined_final outside the trials just screened."""
+    rows = fetch_config_scores(
+        category=None,
+        scored_only=True,
+        limit=30,
+        order="avg_combined_final.desc",
+    )
+    if not rows:
+        return None
+    for row in rows:
+        if str(row.get("config_id") or "") in exclude:
+            continue
+        try:
+            return float(row.get("avg_combined_final"))
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _build_stack(args: argparse.Namespace) -> bool:
@@ -242,6 +283,13 @@ def _build_stack(args: argparse.Namespace) -> bool:
         print("ERROR: pip install -r requirements.txt (optuna)", flush=True)
         return False
 
+    if box.get("run_experiment") is False:
+        print(
+            f"   no category beat the best by more than {MIN_GAIN:.2f}; "
+            "not starting another flat experiment",
+            flush=True,
+        )
+        return False
     category = box["search_category"]
     study_name = args.study or default_study_name(category)
     box["study_name"] = study_name
@@ -256,20 +304,31 @@ def _build_stack(args: argparse.Namespace) -> bool:
     history = fetch_config_scores(category=None, scored_only=True)
     if history is None:
         return False
-    matched = [row for row in history if category in categories_touched(row)]
-    print(
-        f"   {category} experiments={len(matched)} "
-        f"(counted from the parameters each row set)",
-        flush=True,
-    )
-    added, skipped = import_rows(
-        study, matched, category, distributions, optuna, keys=list(box["space"])
-    )
+    if category == COMBO_CATEGORY:
+        print(
+            "   combo: varying "
+            + ", ".join(box["space"])
+            + " across categories; other parameters stay at the best config",
+            flush=True,
+        )
+        added, skipped = 0, 0
+    else:
+        matched = [row for row in history if category in categories_touched(row)]
+        print(
+            f"   {category} experiments={len(matched)} "
+            f"(counted from the parameters each row set)",
+            flush=True,
+        )
+        added, skipped = import_rows(
+            study, matched, category, distributions, optuna, keys=list(box["space"])
+        )
     print(f"   warm-start imported={added} skipped={skipped}", flush=True)
     _settle_running(study, study_name, TrialState)
 
     distinct = _distinct_settings(box["space"])
-    target = args.batch if distinct is None else min(args.batch, distinct)
+    target = min(args.batch, SCREEN_TRIALS)
+    if distinct is not None:
+        target = min(target, distinct)
     if distinct is not None and distinct < args.batch:
         print(
             f"   {category} has {distinct} setting(s); stack uses {target} "
@@ -284,6 +343,23 @@ def _build_stack(args: argparse.Namespace) -> bool:
                 break
     else:
         print(f"   stack target={target}", flush=True)
+
+    best_rows = fetch_config_scores(
+        category=None,
+        scored_only=True,
+        limit=1,
+        order="avg_combined_final.desc",
+    )
+    base, best_row = best_base_updates(best_rows if best_rows else history)
+    if best_row is None:
+        print(f"   base config is the catalog default ({len(base)} parameters)", flush=True)
+    else:
+        print(
+            f"   base config {best_row.get('experiment')} "
+            f"avg_combined_final={float(best_row.get('avg_combined_final')):.4f} "
+            f"({len(base)} parameters); this stack varies {category}",
+            flush=True,
+        )
 
     batch_id = str(uuid.uuid4())
     placed = 0
@@ -306,11 +382,17 @@ def _build_stack(args: argparse.Namespace) -> bool:
             _tell_state(study, trial.number, TrialState.FAIL)
             continue
         seen.add(signature)
+        updates = dict(base)
+        updates.update(params)
         experiment = f"optuna-{category}-t{trial.number}"
-        print(f"   stack [{placed + 1}/{target}] trial={trial.number} {params}", flush=True)
+        print(
+            f"   stack [{placed + 1}/{target}] trial={trial.number} "
+            f"vary={params}  full_keys={len(updates)}",
+            flush=True,
+        )
         config_id = insert_pending_config(
             experiment=experiment,
-            updates=params,
+            updates=updates,
             box=box,
             trial_number=int(trial.number),
             batch_id=batch_id,

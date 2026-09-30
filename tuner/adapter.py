@@ -106,10 +106,15 @@ def open_study(optuna: Any, study_name: str, storage: str, reset: bool = False) 
         load_if_exists=True,
         sampler=optuna.samplers.TPESampler(seed=42, constant_liar=True),
     )
-    # create_study keeps the sampler already stored on an existing study.
-    # Set it again so a batch of asks does not all land on the same point.
+    # TPE uses past scores and handles categorical parameters.
+    # constant_liar keeps a parallel batch from all asking the same point.
+    # CMA-ES and GP are a poor fit: several GATK parameters are categorical.
+    # Hyperband-style pruning needs an epoch loop; the 0.01 screen is the early stop.
     study.sampler = optuna.samplers.TPESampler(seed=42, constant_liar=True)
-    print(f"   study={study_name}  storage={_storage_label(storage)}", flush=True)
+    print(
+        f"   study={study_name}  sampler=TPE  storage={_storage_label(storage)}",
+        flush=True,
+    )
     return study
 
 
@@ -195,6 +200,10 @@ def catalog_categorical_distributions(
     Int and float ranges may shrink. A categorical may not: Optuna raises
     ``CategoricalDistribution does not support dynamic value space``.
     """
+    from tuner.spaces import COMBO_CATEGORY
+
+    if category == COMBO_CATEGORY:
+        return dict(distributions)
     catalog = space_for(category)
     fixed = dict(distributions)
     for key in list(fixed):
@@ -216,8 +225,8 @@ def reconcile_categorical_study(
     Scored history is imported again by the caller. Trials still running keep
     the choice list already stored, so their tell still matches.
     """
-    stored = _stored_categoricals(study)
-    conflicts = _categorical_conflicts(stored, distributions)
+    stored = _stored_distributions(study)
+    conflicts = _distribution_conflicts(stored, distributions)
     if not conflicts:
         return study
     if _has_open_trials(study):
@@ -239,25 +248,33 @@ def reconcile_categorical_study(
     return open_study(optuna, study_name, storage, reset=True)
 
 
-def _stored_categoricals(study: Any) -> Dict[str, Any]:
+def _stored_distributions(study: Any) -> Dict[str, Any]:
     stored: Dict[str, Any] = {}
     for trial in study.trials:
         for name, dist in getattr(trial, "distributions", {}).items():
-            if dist.__class__.__name__ == "CategoricalDistribution":
-                stored[name] = dist
+            stored[name] = dist
     return stored
 
 
-def _categorical_conflicts(
+def _distribution_conflicts(
     stored: Dict[str, Any], distributions: Dict[str, Any]
 ) -> List[tuple]:
     conflicts = []
     for key, dist in distributions.items():
         old = stored.get(key)
-        if old is None or dist.__class__.__name__ != "CategoricalDistribution":
+        if old is None:
             continue
-        if list(old.choices) != list(dist.choices):
-            conflicts.append((key, list(old.choices), list(dist.choices)))
+        if old.__class__.__name__ != dist.__class__.__name__:
+            conflicts.append((key, old.__class__.__name__, dist.__class__.__name__))
+            continue
+        if dist.__class__.__name__ == "CategoricalDistribution":
+            if list(old.choices) != list(dist.choices):
+                conflicts.append((key, list(old.choices), list(dist.choices)))
+            continue
+        old_step = getattr(old, "step", None)
+        new_step = getattr(dist, "step", None)
+        if old_step != new_step or bool(getattr(old, "log", False)) != bool(getattr(dist, "log", False)):
+            conflicts.append((key, old_step, new_step))
     return conflicts
 
 
@@ -269,12 +286,29 @@ def _has_open_trials(study: Any) -> bool:
 
 
 def _to_distribution(optuna: Any, spec: Any) -> Any:
+    from tuner.spaces import coarse_levels, coarse_step
+
     if spec.kind == "int":
+        step = coarse_step(spec)
+        if step:
+            return optuna.distributions.IntDistribution(
+                int(spec.low), int(spec.high), step=int(step)
+            )
         return optuna.distributions.IntDistribution(int(spec.low), int(spec.high))
-    if spec.kind == "float":
+    if spec.kind == "float" and spec.log:
+        levels = coarse_levels(spec)
+        if levels:
+            return optuna.distributions.CategoricalDistribution(list(levels))
         return optuna.distributions.FloatDistribution(
-            float(spec.low), float(spec.high), log=bool(spec.log)
+            float(spec.low), float(spec.high), log=True
         )
+    if spec.kind == "float":
+        step = coarse_step(spec)
+        if step:
+            return optuna.distributions.FloatDistribution(
+                float(spec.low), float(spec.high), step=float(step)
+            )
+        return optuna.distributions.FloatDistribution(float(spec.low), float(spec.high))
     if spec.kind == "categorical":
         return optuna.distributions.CategoricalDistribution(list(spec.choices or ()))
     raise ValueError(f"unknown spec kind {spec.kind!r}")

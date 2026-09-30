@@ -37,13 +37,14 @@ def fetch_config_scores(
     category: Optional[str] = None,
     scored_only: bool = True,
     limit: int = 1000,
+    order: str = "created_at.asc",
 ) -> Optional[List[Dict[str, Any]]]:
     dest = supabase_rest()
     if dest is None:
         return None
     url, key = dest
     view = (os.environ.get("SUPABASE_SCORE_VIEW") or DEFAULT_VIEW).strip()
-    params: List[str] = ["select=*", f"limit={int(limit)}", "order=created_at.asc"]
+    params: List[str] = ["select=*", f"limit={int(limit)}", f"order={order}"]
     if category:
         params.append(f"search_category=eq.{urllib.parse.quote(category, safe='')}")
     if scored_only:

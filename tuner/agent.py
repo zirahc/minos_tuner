@@ -53,7 +53,9 @@ Rules:
 - Optimize avg_combined_final by attacking the largest v2 point loss.
 - Open exactly one search_category from the catalog.
 - space keys must be a subset of that category. Do not add other GATK keys.
-- Numeric low/high may shrink inside the catalog. Categorical choices must be the full catalog list. Optuna cannot change that list later.
+- Numeric values use the coarse step in the catalog. Do not ask for adjacent values such as 32, 34, 36 on a 30-100 range.
+- Categorical choices must be the full catalog list. Optuna cannot change that list later.
+- A combo box may use parameters from more than one category. Keep search_category combo and do not add parameters that are not already in the draft.
 - Each parameter note names the v2 metric it moves. The hypothesis must name that metric and the direction.
 - Search only keys in the chosen category.
 - n_trials is 4..8.
@@ -76,7 +78,9 @@ diagnose which v2 component leaves the most points on the table, review the last
 category, choose the next category, tighten bounds around the best trials.
 
 Keep the draft unless the diagnosis shows a clear mistake.
-You may change search_category, space bounds, n_trials (4..8), hypothesis, or constraints.
+Do not change search_category. The schedule already picked the category or the combo; the other parameters stay at the best config.
+If search_category is combo, keep only parameters already in the draft, and keep the coarse steps. Do not add a 1 or 2 unit change on a wide range.
+You may change space bounds, n_trials (4..8), hypothesis, or constraints.
 Stay inside the catalog. Use each parameter note's v2 metric. The hypothesis must name that metric and the direction. Do not add keys from another category.
 optimize must stay "avg_combined_final".
 
@@ -87,12 +91,17 @@ Return ONLY a JSON object with keys:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv)
-    rows = fetch_config_scores(category=None, scored_only=not args.include_failed)
+    rows = fetch_config_scores(
+        category=None,
+        scored_only=not args.include_failed,
+        order="created_at.desc",
+    )
     if rows is None:
         return 2
+    rows = list(reversed(rows))
 
     history = _compact_history(rows)
-    print(f"   history rows for agent: {len(history)}", flush=True)
+    print(f"   history rows for agent: {len(rows)} (newest {len(history)} kept for the log)", flush=True)
 
     if args.heuristic:
         try:
@@ -113,7 +122,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         source = "llm"
     else:
         try:
-            draft, report = multistep_search_box(history)
+            draft, report = multistep_search_box(rows)
             box = validate_search_box(draft)
         except ValueError as e:
             print(f"ERROR: multi-step box invalid: {e}", flush=True)
@@ -131,6 +140,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print("   step 5 review: accepted", flush=True)
         elif not args.no_review:
             print("   step 5 review: skipped, no API key", flush=True)
+        if report.get("mode") == "stop":
+            box["run_experiment"] = False
 
     box["suggested_by"] = f"agent+{source}"
     out_path = Path(args.out).resolve() if args.out else DEFAULT_OUT
@@ -212,6 +223,11 @@ def _compact_history(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return compact
 
 
+def _pass_counts(report: Dict[str, Any]) -> str:
+    passes = report.get("full_passes") if isinstance(report.get("full_passes"), dict) else {}
+    return " ".join(f"{name}={int(passes.get(name) or 0)}" for name in sorted(passes))
+
+
 def _experiment_counts(report: Dict[str, Any]) -> str:
     categories = report.get("categories") if isinstance(report.get("categories"), dict) else {}
     return " ".join(
@@ -237,7 +253,8 @@ def _print_report(report: Dict[str, Any]) -> None:
     )
     last = report.get("last_category")
     print(
-        f"   step 2 review: last={last} state={report.get('last_state')}",
+        f"   step 2 review: last={last} state={report.get('last_state')} "
+        f"full-config passes: {_pass_counts(report)}",
         flush=True,
     )
     print(

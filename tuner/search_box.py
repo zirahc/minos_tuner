@@ -5,7 +5,17 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Mapping
 
-from tuner.spaces import SPACES, ParamSpec, known_categories, space_for
+from tuner.spaces import (
+    COMBO_CATEGORY,
+    SPACES,
+    ParamSpec,
+    category_of,
+    coarse_levels,
+    coarse_step,
+    known_categories,
+    space_for,
+    spec_of,
+)
 
 ALLOWED_OPTIMIZE = "avg_combined_final"
 MIN_TRIALS = 1
@@ -21,6 +31,13 @@ def specs_to_space_json(specs: Mapping[str, ParamSpec]) -> Dict[str, Any]:
             item["high"] = spec.high
             if spec.log:
                 item["log"] = True
+                levels = coarse_levels(spec)
+                if levels:
+                    item["choices"] = list(levels)
+            else:
+                step = coarse_step(spec)
+                if step is not None:
+                    item["step"] = step
         if spec.kind == "categorical":
             item["choices"] = list(spec.choices or ())
         if spec.note:
@@ -37,9 +54,9 @@ def validate_search_box(raw: Mapping[str, Any]) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("search box must be a JSON object")
     category = str(raw.get("search_category") or "").strip()
-    if category not in SPACES:
+    if category not in SPACES and category != COMBO_CATEGORY:
         raise ValueError(
-            f"search_category must be one of: {', '.join(known_categories())}"
+            f"search_category must be one of: {', '.join(known_categories())}, {COMBO_CATEGORY}"
         )
     hypothesis = str(raw.get("hypothesis") or "").strip()
     if not hypothesis:
@@ -53,21 +70,33 @@ def validate_search_box(raw: Mapping[str, Any]) -> Dict[str, Any]:
     if n_trials < MIN_TRIALS or n_trials > MAX_TRIALS:
         raise ValueError(f"n_trials must be {MIN_TRIALS}..{MAX_TRIALS}")
 
-    allowed = space_for(category)
     space_in = raw.get("space")
     if not isinstance(space_in, dict) or not space_in:
         raise ValueError("space must be a non-empty object of GATK keys")
     space_out: Dict[str, Any] = {}
+    seen_categories = set()
     for key, spec_in in space_in.items():
-        if key not in allowed:
-            raise ValueError(f"key {key!r} is not in category {category}")
+        if category == COMBO_CATEGORY:
+            allowed_spec = spec_of(str(key))
+            owner = category_of(str(key))
+            if allowed_spec is None or owner is None:
+                raise ValueError(f"key {key!r} is not in the catalog")
+            seen_categories.add(owner)
+        else:
+            allowed = space_for(category)
+            if key not in allowed:
+                raise ValueError(f"key {key!r} is not in category {category}")
+            allowed_spec = allowed[key]
         if not isinstance(spec_in, dict):
             raise ValueError(f"space.{key} must be an object")
-        space_out[key] = _validate_spec(key, allowed[key], spec_in)
+        space_out[key] = _validate_spec(key, allowed_spec, spec_in)
+    if category == COMBO_CATEGORY and len(seen_categories) < 2:
+        raise ValueError("combo space must use parameters from at least two categories")
 
     constraints_in = raw.get("constraints") if isinstance(raw.get("constraints"), dict) else {}
     constraints = _validate_constraints(constraints_in)
 
+    run_experiment = raw.get("run_experiment", True)
     return {
         "search_category": category,
         "hypothesis": hypothesis,
@@ -75,6 +104,7 @@ def validate_search_box(raw: Mapping[str, Any]) -> Dict[str, Any]:
         "constraints": constraints,
         "n_trials": n_trials,
         "optimize": ALLOWED_OPTIMIZE,
+        "run_experiment": bool(run_experiment),
     }
 
 
@@ -90,11 +120,24 @@ def optuna_distributions(space: Mapping[str, Any], optuna: Any) -> Dict[str, Any
     for key, spec in space.items():
         kind = spec.get("type")
         if kind == "int":
-            dists[key] = optuna.distributions.IntDistribution(int(spec["low"]), int(spec["high"]))
-        elif kind == "float":
-            dists[key] = optuna.distributions.FloatDistribution(
-                float(spec["low"]), float(spec["high"]), log=bool(spec.get("log"))
+            step = spec.get("step")
+            dists[key] = optuna.distributions.IntDistribution(
+                int(spec["low"]),
+                int(spec["high"]),
+                step=int(step) if step else 1,
             )
+        elif kind == "float" and spec.get("log") and spec.get("choices"):
+            dists[key] = optuna.distributions.CategoricalDistribution(list(spec["choices"]))
+        elif kind == "float":
+            step = spec.get("step")
+            if step:
+                dists[key] = optuna.distributions.FloatDistribution(
+                    float(spec["low"]), float(spec["high"]), step=float(step)
+                )
+            else:
+                dists[key] = optuna.distributions.FloatDistribution(
+                    float(spec["low"]), float(spec["high"])
+                )
         elif kind == "categorical":
             dists[key] = optuna.distributions.CategoricalDistribution(list(spec.get("choices") or []))
         else:
@@ -129,9 +172,20 @@ def _validate_spec(key: str, allowed: ParamSpec, spec_in: Mapping[str, Any]) -> 
         raise ValueError(f"{key}: high {high_f} above allowed {allowed.high}")
     if low_f > high_f:
         raise ValueError(f"{key}: low > high")
-    out: Dict[str, Any] = {"type": kind, "low": int(low_f) if kind == "int" else low_f, "high": int(high_f) if kind == "int" else high_f}
-    if allowed.log or spec_in.get("log"):
+    out: Dict[str, Any] = {
+        "type": kind,
+        "low": int(low_f) if kind == "int" else low_f,
+        "high": int(high_f) if kind == "int" else high_f,
+    }
+    if allowed.log:
         out["log"] = True
+        levels = coarse_levels(allowed)
+        if levels:
+            out["choices"] = list(levels)
+        return out
+    step = coarse_step(allowed)
+    if step is not None:
+        out["step"] = int(step) if kind == "int" else step
     return out
 
 
