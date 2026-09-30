@@ -58,9 +58,10 @@ Rules:
 - A combo box may use parameters from more than one category. Keep search_category combo and do not add parameters that are not already in the draft.
 - Each parameter note names the v2 metric it moves. The hypothesis must name that metric and the direction.
 - Search only keys in the chosen category.
-- n_trials is how many trials this category needs, from 1 to 90.
-- An integer range of 30 to 100 may use 70 trials. Do not set n_trials above 90.
-- A category with only a few choices, such as 4 PCR models, should use that many trials, not 70.
+- n_trials is the product of every parameter in this search, from 1 to 90.
+- One integer range of 30 to 100 is 70 trials.
+- When several parameters are searched together, multiply. 4 PCR models times another parameter's count. Do not leave that search at 4.
+- A search that only varies the 4 PCR models uses 4 trials. Do not set n_trials above 90.
 - One category per round.
 - Failed / missing scores are not a GATK failure; ignore them for ranking.
 - Write a short hypothesis that a later review can confirm or reject.
@@ -83,8 +84,8 @@ Keep the draft unless the diagnosis shows a clear mistake.
 Do not change search_category. The schedule already picked the category or the combo; the other parameters stay at the best config.
 If search_category is combo, keep only parameters already in the draft, and keep the coarse steps. Do not add a 1 or 2 unit change on a wide range.
 You may change space bounds, n_trials (1..90), hypothesis, or constraints.
-n_trials should cover the widest range: 70 is acceptable for 30..100, and 90 is the maximum.
-Do not use 70 trials for a parameter that only has a handful of choices.
+n_trials is the product of the parameters being varied. 70 is acceptable for one 30..100 range.
+4 PCR models times another parameter is more than 4. Cap the product at 90.
 Stay inside the catalog. Use each parameter note's v2 metric. The hypothesis must name that metric and the direction. Do not add keys from another category.
 optimize must stay "avg_combined_final".
 

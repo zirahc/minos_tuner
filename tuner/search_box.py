@@ -116,22 +116,24 @@ def load_search_box(path: Path) -> Dict[str, Any]:
     return validate_search_box(raw)
 
 
+def _param_trials(spec: Mapping[str, Any]) -> int:
+    """Trials for one parameter. A 30..100 range is 70. A 4-choice model is 4."""
+    choices = list(spec.get("choices") or [])
+    if spec.get("type") == "categorical" or (spec.get("log") and choices):
+        return max(1, len(choices))
+    try:
+        span = int(round(float(spec["high"]) - float(spec["low"])))
+    except (KeyError, TypeError, ValueError):
+        return 1
+    return max(1, span)
+
+
 def enough_trials(space: Mapping[str, Any]) -> int:
-    """How many trials cover this box. A 30..100 range is 70. Capped at 90."""
+    """Product of each parameter's size. 4 PCR models times another range, capped at 90."""
     needed = 1
     for spec in space.values():
-        if not isinstance(spec, dict):
-            continue
-        choices = list(spec.get("choices") or [])
-        if spec.get("type") == "categorical" or (spec.get("log") and choices):
-            needed = max(needed, len(choices))
-            continue
-        try:
-            span = int(round(float(spec["high"]) - float(spec["low"])))
-        except (KeyError, TypeError, ValueError):
-            continue
-        if span > needed:
-            needed = span
+        if isinstance(spec, dict):
+            needed *= _param_trials(spec)
     return max(MIN_TRIALS, min(MAX_TRIALS, needed))
 
 
