@@ -32,6 +32,7 @@ fi
 python3 - "$SUBNET_DIR" <<'PY'
 import os
 import select
+import signal
 import sys
 import time
 
@@ -46,6 +47,7 @@ if pid == 0:
     os.close(master)
     os.close(slave)
     os.chdir(subnet)
+    os.environ["TERM"] = "xterm-256color"
     os.execvp("bash", ["bash", "install.sh", "--no-ai-assistant"])
 
 os.close(slave)
@@ -74,9 +76,19 @@ try:
             text = buf.decode("utf-8", "ignore")
             if "Existing installation detected" in text or "Update complete" in text:
                 update_only = True
+            if "No existing wallets found" in text or (
+                "Live miners and validators need a Bittensor hotkey" in text
+            ):
+                print(
+                    "\nERROR: installer selected Miner, not Demo miner.",
+                    file=sys.stderr,
+                )
+                os.kill(pid, signal.SIGTERM)
+                sys.exit(1)
             if pending is None and (not role_sent) and ("What are you setting up?" in text):
-                # Third choice is Demo miner. Extra downs stay on that row.
-                pending = b"\x1b[B\x1b[B\x1b[B\r"
+                # Miner, Validator, Demo miner. Two downs land on Demo miner.
+                # A third down wraps back to Miner.
+                pending = b"\x1b[B\x1b[B\r"
                 send_at = time.time() + 1.0
                 role_sent = True
             elif (
