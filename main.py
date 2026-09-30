@@ -23,6 +23,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -174,7 +175,7 @@ def run_wait_loop(args: argparse.Namespace) -> int:
             flush=True,
         )
         return 2
-    from tuner.jobs import claim_worker_job, patch_config, touch_worker
+    from tuner.jobs import claim_worker_job, finish_owned_job, touch_worker
 
     print("=" * 72, flush=True)
     print("  GATK VPS  waiting for tuner updates", flush=True)
@@ -182,13 +183,20 @@ def run_wait_loop(args: argparse.Namespace) -> int:
     print(f"   worker={worker_id}  MINOS={root}  poll={args.poll}s", flush=True)
     print("   this machine posts itself so the fleet can assign work", flush=True)
     print("   stop with Ctrl+C", flush=True)
-    while True:
-        try:
+    stop_beat = threading.Event()
+
+    def _beat() -> None:
+        while not stop_beat.is_set():
             if not touch_worker(worker_id):
                 print(
                     f"   WARNING: worker={worker_id} could not post online status",
                     flush=True,
                 )
+            stop_beat.wait(max(5, args.poll))
+
+    threading.Thread(target=_beat, name="worker-heartbeat", daemon=True).start()
+    while True:
+        try:
             job = claim_worker_job(worker_id)
             if not job:
                 print(f"   worker={worker_id} waiting for a GATK update ...", flush=True)
@@ -201,9 +209,10 @@ def run_wait_loop(args: argparse.Namespace) -> int:
                 practice=practice,
                 root=root,
                 rounds_override=args.rounds,
-                patch_config=patch_config,
+                worker_id=worker_id,
             )
         except KeyboardInterrupt:
+            stop_beat.set()
             print(f"\n   worker={worker_id} stopped", flush=True)
             return 0
         except Exception as e:
@@ -223,8 +232,10 @@ def _run_assigned_job(
     practice: Path,
     root: Path,
     rounds_override: int,
-    patch_config: Any,
+    worker_id: str,
 ) -> int:
+    from tuner.jobs import finish_owned_job
+
     config_id = str(job.get("id") or "")
     updates = job.get("gatk_updates") if isinstance(job.get("gatk_updates"), dict) else {}
     rounds = int(rounds_override or job.get("rounds_target") or 15)
@@ -235,17 +246,27 @@ def _run_assigned_job(
         f"offset={offset}  updates={updates}",
         flush=True,
     )
+
+    def _finish(fields: Dict[str, Any]) -> bool:
+        if finish_owned_job(config_id, worker_id, fields):
+            return True
+        print(
+            f"   job {config_id} was given to another machine",
+            flush=True,
+        )
+        return False
+
     try:
         original = conf.read_text(encoding="utf-8")
     except OSError as e:
         print(f"ERROR: read {conf}: {e}", flush=True)
-        patch_config(config_id, {"status": "failed"})
+        _finish({"status": "failed"})
         return 1
     try:
         if updates:
             changed = update_gatk_conf(conf, updates)
             if changed is None:
-                patch_config(config_id, {"status": "failed"})
+                _finish({"status": "failed"})
                 return 1
             for key, old, new in changed:
                 print(f"     {key}: {old} -> {new}", flush=True)
@@ -255,11 +276,11 @@ def _run_assigned_job(
             n_rounds = stage_practice_rounds(practice, stage, rounds, offset)
         except OSError as e:
             print(f"ERROR: could not stage {rounds} rounds: {e}", flush=True)
-            patch_config(config_id, {"status": "failed", "gatk_config": gatk_params})
+            _finish({"status": "failed", "gatk_config": gatk_params})
             return 1
         if n_rounds <= 0:
             print(f"ERROR: no complete practice rounds under {practice}", flush=True)
-            patch_config(config_id, {"status": "failed", "gatk_config": gatk_params})
+            _finish({"status": "failed", "gatk_config": gatk_params})
             return 1
         print(f"   scoring {n_rounds} practice round(s)", flush=True)
         started = time.time()
@@ -267,16 +288,18 @@ def _run_assigned_job(
             [sys.executable, str(scorer), "--practice-dir", str(stage), "--config", str(conf)],
             cwd=str(root),
         )
+        if not _finish({"gatk_config": gatk_params}):
+            return 0
         scores = _scores_since(stage, started)
+        scored_ok = [s for s in scores if s.get("ok") and s.get("combined_final") is not None]
         print(
             f"   posting {len(scores)} individual round row(s) to gatk_evaluations",
             flush=True,
         )
-        scored_ok = [s for s in scores if s.get("ok") and s.get("combined_final") is not None]
         posted = post_evaluations(config_id, scores)
         status = "scored" if posted and scored_ok else "failed"
-        patch_config(config_id, {"status": status, "gatk_config": gatk_params})
-        patch_config(config_id, {"rounds_done": len(scored_ok)})
+        if not _finish({"status": status, "rounds_done": len(scored_ok)}):
+            return 0
         print(
             f"   job {config_id} {status}  rounds_done={len(scored_ok)}  "
             f"scorer_exit={scored.returncode}",

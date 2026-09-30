@@ -51,6 +51,7 @@ from tuner.jobs import (
     list_online_workers,
     list_open_jobs,
     list_queued,
+    release_offline_job,
     requeue_confirmation,
 )
 from tuner.search_box import MAX_TRIALS, load_search_box, optuna_distributions
@@ -128,6 +129,21 @@ def run_once(args: argparse.Namespace) -> int:
                 flush=True,
             )
             seen_online = workers
+        online = set(workers)
+        for config_id, job in list(watching.items()):
+            holder = str(job.get("worker_id") or "")
+            if not holder or holder in online:
+                continue
+            released = release_offline_job(config_id)
+            if not released:
+                continue
+            watching.pop(config_id, None)
+            queued.append(released)
+            print(
+                f"   worker={holder} offline; trial "
+                f"{released.get('optuna_trial_number')} returned to the stack",
+                flush=True,
+            )
         busy = {
             str(job.get("worker_id"))
             for job in watching.values()

@@ -105,6 +105,37 @@ def list_queued() -> Optional[List[Dict[str, Any]]]:
     return data if isinstance(data, list) else []
 
 
+def release_offline_job(config_id: str) -> Optional[Dict[str, Any]]:
+    """Put a pending or running trial back on the stack after its VPS stops."""
+    updated = rest_json(
+        "PATCH",
+        config_table(),
+        query="&".join([
+            f"id=eq.{urllib.parse.quote(str(config_id), safe='')}",
+            "status=in.(pending,running)",
+        ]),
+        body={"status": "queued", "worker_id": None},
+    )
+    if isinstance(updated, list) and updated and isinstance(updated[0], dict):
+        return updated[0]
+    return None
+
+
+def finish_owned_job(config_id: str, worker_id: str, fields: Dict[str, Any]) -> bool:
+    """Update a job only while this VPS still holds it."""
+    updated = rest_json(
+        "PATCH",
+        config_table(),
+        query="&".join([
+            f"id=eq.{urllib.parse.quote(str(config_id), safe='')}",
+            f"worker_id=eq.{urllib.parse.quote(str(worker_id), safe='')}",
+            "status=eq.running",
+        ]),
+        body=fields,
+    )
+    return isinstance(updated, list) and bool(updated)
+
+
 def assign_queued(config_id: str, worker_id: str) -> Optional[Dict[str, Any]]:
     """Give the next stacked trial to one free VPS."""
     claimed = rest_json(
