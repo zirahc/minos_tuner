@@ -286,14 +286,9 @@ def _has_open_trials(study: Any) -> bool:
 
 
 def _to_distribution(optuna: Any, spec: Any) -> Any:
-    from tuner.spaces import coarse_levels, coarse_step
+    from tuner.spaces import coarse_levels
 
     if spec.kind == "int":
-        step = coarse_step(spec)
-        if step:
-            return optuna.distributions.IntDistribution(
-                int(spec.low), int(spec.high), step=int(step)
-            )
         return optuna.distributions.IntDistribution(int(spec.low), int(spec.high))
     if spec.kind == "float" and spec.log:
         levels = coarse_levels(spec)
@@ -303,11 +298,6 @@ def _to_distribution(optuna: Any, spec: Any) -> Any:
             float(spec.low), float(spec.high), log=True
         )
     if spec.kind == "float":
-        step = coarse_step(spec)
-        if step:
-            return optuna.distributions.FloatDistribution(
-                float(spec.low), float(spec.high), step=float(step)
-            )
         return optuna.distributions.FloatDistribution(float(spec.low), float(spec.high))
     if spec.kind == "categorical":
         return optuna.distributions.CategoricalDistribution(list(spec.choices or ()))

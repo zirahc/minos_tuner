@@ -50,15 +50,13 @@ from tuner.jobs import (
     list_queued,
     requeue_confirmation,
 )
-from tuner.search_box import load_search_box, optuna_distributions
+from tuner.search_box import MAX_TRIALS, load_search_box, optuna_distributions
 from tuner.spaces import COMBO_CATEGORY, best_base_updates, categories_touched, default_study_name
 from tuner.steps import MIN_GAIN
 from tuner.supabase_scores import fetch_config_scores
 
 DEFAULT_BOX = TUNER_ROOT / "search_box.json"
 TERMINAL = ("scored", "failed")
-# One category screen. A larger batch keeps sampling a flat region.
-SCREEN_TRIALS = 8
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -325,11 +323,10 @@ def _build_stack(args: argparse.Namespace) -> bool:
     print(f"   warm-start imported={added} skipped={skipped}", flush=True)
     _settle_running(study, study_name, TrialState)
 
-    distinct = _distinct_settings(box["space"])
-    target = min(args.batch, SCREEN_TRIALS)
-    if distinct is not None:
-        target = min(target, distinct)
-    if distinct is not None and distinct < args.batch:
+    budget = max(1, min(MAX_TRIALS, int(box.get("n_trials") or 1)))
+    distinct = _fixed_choice_count(box["space"])
+    target = budget if distinct is None else min(budget, distinct)
+    if distinct is not None and distinct < budget:
         print(
             f"   {category} has {distinct} setting(s); stack uses {target} "
             "so the same option is not scored twice",
@@ -497,30 +494,70 @@ def _tell_state(study: Any, number: int, state: Any = None, value: Optional[floa
         print(f"   WARNING: tell trial={number} failed: {e}", flush=True)
 
 
-def _distinct_settings(space: Dict[str, Any]) -> Optional[int]:
-    """Number of different settings in a discrete box. None when a float range remains."""
+def _fixed_choice_count(space: Dict[str, Any]) -> Optional[int]:
+    """Choice product when every parameter is categorical. None if a numeric range remains."""
     total = 1
     for spec in space.values():
         if not isinstance(spec, dict):
             continue
         kind = spec.get("type")
-        if kind == "float":
+        choices = list(spec.get("choices") or [])
+        numeric = kind in ("int", "float") and not (kind == "float" and spec.get("log") and choices)
+        if numeric:
             try:
                 if float(spec["high"]) > float(spec["low"]):
                     return None
             except (KeyError, TypeError, ValueError):
-                continue
-        elif kind == "int":
+                return None
+        if len(choices) > 1:
+            total *= len(choices)
+    return max(1, total)
+
+
+def _grid_values(spec: Dict[str, Any]) -> Optional[List[Any]]:
+    """Coarse values for one parameter. None when the range is still continuous."""
+    kind = spec.get("type")
+    choices = spec.get("choices")
+    if kind == "categorical" or choices:
+        values = list(choices or [])
+        return values or None
+    if kind not in ("int", "float"):
+        return None
+    try:
+        low = float(spec["low"])
+        high = float(spec["high"])
+        step = float(spec["step"])
+    except (KeyError, TypeError, ValueError):
+        if kind == "int":
             try:
-                span = int(spec["high"]) - int(spec["low"]) + 1
+                return list(range(int(spec["low"]), int(spec["high"]) + 1))
             except (KeyError, TypeError, ValueError):
-                continue
-            if span > 1:
-                total *= span
-        elif kind == "categorical":
-            count = len(spec.get("choices") or [])
-            if count > 1:
-                total *= count
+                return None
+        return None
+    if step <= 0 or high < low:
+        return None
+    values = []
+    n = 0
+    while n < 10000:
+        value = low + n * step
+        if value > high + 1e-9:
+            break
+        values.append(int(round(value)) if kind == "int" else value)
+        n += 1
+    return values or None
+
+
+def _distinct_settings(space: Dict[str, Any]) -> Optional[int]:
+    """Number of coarse settings. None when a continuous float range remains."""
+    total = 1
+    for spec in space.values():
+        if not isinstance(spec, dict):
+            continue
+        values = _grid_values(spec)
+        if values is None:
+            return None
+        if len(values) > 1:
+            total *= len(values)
         if total > 100000:
             return None
     return max(1, total)
@@ -529,13 +566,12 @@ def _distinct_settings(space: Dict[str, Any]) -> Optional[int]:
 def _enumerate_settings(space: Dict[str, Any]) -> List[Dict[str, Any]]:
     dims: List[tuple] = []
     for key, spec in space.items():
-        kind = spec.get("type")
-        if kind == "categorical":
-            dims.append((key, list(spec.get("choices") or [])))
-        elif kind == "int":
-            dims.append((key, list(range(int(spec["low"]), int(spec["high"]) + 1))))
-        else:
+        if not isinstance(spec, dict):
+            continue
+        values = _grid_values(spec)
+        if values is None:
             return []
+        dims.append((key, values))
     if not dims:
         return []
     rows: List[Dict[str, Any]] = [{}]

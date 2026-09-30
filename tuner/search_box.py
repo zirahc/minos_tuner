@@ -19,7 +19,8 @@ from tuner.spaces import (
 
 ALLOWED_OPTIMIZE = "avg_combined_final"
 MIN_TRIALS = 1
-MAX_TRIALS = 8
+# An integer span of 70 (30..100) may all be tried. Never more than 90.
+MAX_TRIALS = 90
 
 
 def specs_to_space_json(specs: Mapping[str, ParamSpec]) -> Dict[str, Any]:
@@ -115,29 +116,37 @@ def load_search_box(path: Path) -> Dict[str, Any]:
     return validate_search_box(raw)
 
 
+def enough_trials(space: Mapping[str, Any]) -> int:
+    """How many trials cover this box. A 30..100 range is 70. Capped at 90."""
+    needed = 1
+    for spec in space.values():
+        if not isinstance(spec, dict):
+            continue
+        choices = list(spec.get("choices") or [])
+        if spec.get("type") == "categorical" or (spec.get("log") and choices):
+            needed = max(needed, len(choices))
+            continue
+        try:
+            span = int(round(float(spec["high"]) - float(spec["low"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if span > needed:
+            needed = span
+    return max(MIN_TRIALS, min(MAX_TRIALS, needed))
+
+
 def optuna_distributions(space: Mapping[str, Any], optuna: Any) -> Dict[str, Any]:
     dists: Dict[str, Any] = {}
     for key, spec in space.items():
         kind = spec.get("type")
         if kind == "int":
-            step = spec.get("step")
-            dists[key] = optuna.distributions.IntDistribution(
-                int(spec["low"]),
-                int(spec["high"]),
-                step=int(step) if step else 1,
-            )
+            dists[key] = optuna.distributions.IntDistribution(int(spec["low"]), int(spec["high"]))
         elif kind == "float" and spec.get("log") and spec.get("choices"):
             dists[key] = optuna.distributions.CategoricalDistribution(list(spec["choices"]))
         elif kind == "float":
-            step = spec.get("step")
-            if step:
-                dists[key] = optuna.distributions.FloatDistribution(
-                    float(spec["low"]), float(spec["high"]), step=float(step)
-                )
-            else:
-                dists[key] = optuna.distributions.FloatDistribution(
-                    float(spec["low"]), float(spec["high"])
-                )
+            dists[key] = optuna.distributions.FloatDistribution(
+                float(spec["low"]), float(spec["high"])
+            )
         elif kind == "categorical":
             dists[key] = optuna.distributions.CategoricalDistribution(list(spec.get("choices") or []))
         else:

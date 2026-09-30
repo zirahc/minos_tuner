@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from tuner.search_box import specs_to_space_json
+from tuner.search_box import enough_trials, specs_to_space_json
 from tuner.spaces import (
     COMBO_CATEGORY,
     SPACES,
@@ -96,7 +96,7 @@ def multistep_search_box(
         bounds = "coarse"
     else:
         bounds = "shrunk" if space != specs_to_space_json(space_for(category)) else "full"
-    n_trials = 4 if bounds == "shrunk" else 6
+    n_trials = enough_trials(space)
     hypothesis = _hypothesis(report, category, reason, bounds)
     report.update({
         "choice": category,

@@ -32,7 +32,7 @@ try:
 except ImportError:
     pass
 
-from tuner.search_box import specs_to_space_json, validate_search_box, write_search_box
+from tuner.search_box import enough_trials, specs_to_space_json, validate_search_box, write_search_box
 from tuner.spaces import agent_reference, category_instruction
 from tuner.spaces import space_for
 from tuner.steps import multistep_search_box
@@ -58,7 +58,9 @@ Rules:
 - A combo box may use parameters from more than one category. Keep search_category combo and do not add parameters that are not already in the draft.
 - Each parameter note names the v2 metric it moves. The hypothesis must name that metric and the direction.
 - Search only keys in the chosen category.
-- n_trials is 4..8.
+- n_trials is how many trials this category needs, from 1 to 90.
+- An integer range of 30 to 100 may use 70 trials. Do not set n_trials above 90.
+- A category with only a few choices, such as 4 PCR models, should use that many trials, not 70.
 - One category per round.
 - Failed / missing scores are not a GATK failure; ignore them for ranking.
 - Write a short hypothesis that a later review can confirm or reject.
@@ -80,7 +82,9 @@ category, choose the next category, tighten bounds around the best trials.
 Keep the draft unless the diagnosis shows a clear mistake.
 Do not change search_category. The schedule already picked the category or the combo; the other parameters stay at the best config.
 If search_category is combo, keep only parameters already in the draft, and keep the coarse steps. Do not add a 1 or 2 unit change on a wide range.
-You may change space bounds, n_trials (4..8), hypothesis, or constraints.
+You may change space bounds, n_trials (1..90), hypothesis, or constraints.
+n_trials should cover the widest range: 70 is acceptable for 30..100, and 90 is the maximum.
+Do not use 70 trials for a parameter that only has a handful of choices.
 Stay inside the catalog. Use each parameter note's v2 metric. The hypothesis must name that metric and the direction. Do not add keys from another category.
 optimize must stay "avg_combined_final".
 
@@ -191,12 +195,13 @@ def heuristic_search_box(history: List[Dict[str, Any]]) -> Dict[str, Any]:
     if f1_indel is not None:
         constraints["min_avg_f1_indel"] = round(max(0.0, min(1.0, f1_indel - 0.02)), 4)
 
+    space = specs_to_space_json(space_for(category))
     return {
         "search_category": category,
         "hypothesis": hypothesis,
-        "space": specs_to_space_json(space_for(category)),
+        "space": space,
         "constraints": constraints,
-        "n_trials": 6,
+        "n_trials": enough_trials(space),
         "optimize": "avg_combined_final",
     }
 
