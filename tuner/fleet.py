@@ -11,6 +11,8 @@ trial immediately. When the stack and its checks are done, the agent
 builds the next stack.
 
 Stop with Ctrl+C. GATK machines run: python main.py
+A machine posts its WORKER_ID while main.py is running. The fleet
+gives the next trial to any machine that posted recently.
 """
 from __future__ import annotations
 
@@ -46,7 +48,8 @@ from tuner.jobs import (
     config_for_trial,
     fetch_score_row,
     insert_pending_config,
-    list_jobs_for_workers,
+    list_online_workers,
+    list_open_jobs,
     list_queued,
     requeue_confirmation,
 )
@@ -61,19 +64,15 @@ TERMINAL = ("scored", "failed")
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv)
-    workers = _workers(args.workers)
-    if not workers:
-        print("ERROR: set TUNER_WORKERS to the GATK VPS ids.", flush=True)
-        return 2
     if args.batch < 1:
         print("ERROR: FLEET_BATCH must be at least 1.", flush=True)
         return 2
     print(
-        f"   fleet workers={','.join(workers)}  stack={args.batch}  "
+        f"   fleet reads online workers from gatk_workers  stack={args.batch}  "
         f"rounds={args.rounds}  poll={args.poll}s",
         flush=True,
     )
-    print("   a free VPS takes the next trial from the stack", flush=True)
+    print("   a machine that runs main.py is given the next trial", flush=True)
     print(
         f"   every trial scores {args.rounds} round(s); the top quarter then "
         f"scores the next {args.rounds}",
@@ -84,7 +83,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("   stop with Ctrl+C", flush=True)
     while True:
         try:
-            rc = run_once(args, workers)
+            rc = run_once(args)
         except KeyboardInterrupt:
             print("\n   tuner stopped", flush=True)
             return 0
@@ -100,25 +99,35 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"   stack returned {rc} — next cycle anyway", flush=True)
 
 
-def run_once(args: argparse.Namespace, workers: List[str]) -> int:
+def run_once(args: argparse.Namespace) -> int:
     queued = list_queued()
-    inflight = list_jobs_for_workers(workers, ["pending", "running"])
+    inflight = list_open_jobs()
     if queued is None or inflight is None:
         return 2
     if not queued and not inflight:
         if not _build_stack(args):
             return 2
         queued = list_queued()
-        inflight = list_jobs_for_workers(workers, ["pending", "running"])
+        inflight = list_open_jobs()
         if queued is None or inflight is None:
             return 2
     watching = {str(job.get("id")): job for job in inflight if job.get("id")}
     screened: Dict[str, Dict[str, Any]] = {}
+    seen_online: Optional[List[str]] = None
     print(
         f"   stack={len(queued)}  running={len(watching)}",
         flush=True,
     )
     while True:
+        workers = list_online_workers(max(180, args.poll * 6))
+        if workers is None:
+            return 2
+        if workers != seen_online:
+            print(
+                f"   online workers={','.join(workers) if workers else '-'}",
+                flush=True,
+            )
+            seen_online = workers
         busy = {
             str(job.get("worker_id"))
             for job in watching.values()
@@ -173,10 +182,17 @@ def run_once(args: argparse.Namespace, workers: List[str]) -> int:
             print("   stack finished — agent will set the next trials", flush=True)
             return 0
         waiting = ",".join(str(job.get("worker_id")) for job in watching.values())
-        print(
-            f"   stack_left={len(queued)}  waiting workers={waiting or '-'}",
-            flush=True,
-        )
+        if queued and not free:
+            print(
+                f"   stack_left={len(queued)}  waiting workers={waiting or '-'}  "
+                "no free machine online",
+                flush=True,
+            )
+        else:
+            print(
+                f"   stack_left={len(queued)}  waiting workers={waiting or '-'}",
+                flush=True,
+            )
         time.sleep(max(1, args.poll))
         refreshed = list_queued()
         if refreshed is None:
@@ -580,18 +596,14 @@ def _enumerate_settings(space: Dict[str, Any]) -> List[Dict[str, Any]]:
     return rows
 
 
-def _workers(raw: str) -> List[str]:
-    return [part.strip() for part in raw.split(",") if part.strip()]
-
-
 def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run the GATK tuning stack until Ctrl+C.")
     p.add_argument("--box", default=str(DEFAULT_BOX))
     p.add_argument("--study", default=None)
     p.add_argument(
         "--workers",
-        default=os.environ.get("TUNER_WORKERS") or "1,2,3,4",
-        help="WORKER_ID values, one per GATK VPS (default 1,2,3,4).",
+        default=os.environ.get("TUNER_WORKERS") or "",
+        help="Ignored. Online machines are read from gatk_workers.",
     )
     p.add_argument(
         "--batch",

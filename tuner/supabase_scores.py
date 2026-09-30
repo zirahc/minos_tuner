@@ -87,6 +87,7 @@ def rest_json(
     query: str = "",
     body: Any = None,
     timeout: int = 60,
+    prefer: Optional[str] = None,
 ) -> Optional[Any]:
     dest = supabase_rest()
     if dest is None:
@@ -100,7 +101,7 @@ def rest_json(
         "Accept": "application/json",
         "apikey": key,
         "Authorization": f"Bearer {key}",
-        "Prefer": "return=representation",
+        "Prefer": prefer or "return=representation",
     }
     if data is not None:
         headers["Content-Type"] = "application/json"

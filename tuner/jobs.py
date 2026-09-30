@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.parse
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -12,6 +13,7 @@ from tuner.supabase_scores import rest_json
 CONFIG_TABLE = "gatk_configs"
 EVAL_TABLE = "gatk_evaluations"
 SCORE_VIEW = "gatk_config_scores"
+WORKER_TABLE = "gatk_workers"
 
 
 def config_table() -> str:
@@ -117,6 +119,57 @@ def assign_queued(config_id: str, worker_id: str) -> Optional[Dict[str, Any]]:
     if isinstance(claimed, list) and claimed and isinstance(claimed[0], dict):
         return claimed[0]
     return None
+
+
+def touch_worker(worker_id: str) -> bool:
+    """Tell the fleet this VPS is running. Safe to call on every poll."""
+    now = datetime.now(timezone.utc).isoformat()
+    updated = rest_json(
+        "POST",
+        WORKER_TABLE,
+        query="on_conflict=worker_id",
+        body={
+            "worker_id": str(worker_id),
+            "last_seen": now,
+            "status": "online",
+        },
+        prefer="resolution=merge-duplicates,return=representation",
+    )
+    return updated is not None
+
+
+def list_online_workers(stale_sec: int = 180) -> Optional[List[str]]:
+    """Worker ids whose main.py posted a heartbeat inside the window."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=int(stale_sec))).isoformat()
+    query = "&".join([
+        "select=worker_id",
+        "status=eq.online",
+        f"last_seen=gte.{urllib.parse.quote(cutoff, safe='')}",
+        "order=worker_id.asc",
+    ])
+    data = rest_json("GET", WORKER_TABLE, query=query)
+    if data is None:
+        return None
+    if not isinstance(data, list):
+        return []
+    found = []
+    for row in data:
+        if isinstance(row, dict) and row.get("worker_id"):
+            found.append(str(row["worker_id"]))
+    return found
+
+
+def list_open_jobs() -> Optional[List[Dict[str, Any]]]:
+    """Pending and running jobs, whatever worker currently holds them."""
+    query = "&".join([
+        "select=*",
+        "status=in.(pending,running)",
+        "order=created_at.asc",
+    ])
+    data = rest_json("GET", config_table(), query=query)
+    if data is None:
+        return None
+    return data if isinstance(data, list) else []
 
 
 def list_jobs_for_workers(

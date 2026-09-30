@@ -161,7 +161,7 @@ def run_wait_loop(args: argparse.Namespace) -> int:
     """Claim this VPS's next tuner job, score FLEET rounds, POST, repeat."""
     worker_id = str(args.worker or "").strip()
     if not worker_id:
-        print("ERROR: set WORKER_ID (1, 2, 3, or 4) or pass --worker.", flush=True)
+        print("ERROR: set WORKER_ID or pass --worker.", flush=True)
         return 2
     dest = _supabase_dest()
     if dest is None:
@@ -174,15 +174,21 @@ def run_wait_loop(args: argparse.Namespace) -> int:
             flush=True,
         )
         return 2
-    from tuner.jobs import claim_worker_job, patch_config
+    from tuner.jobs import claim_worker_job, patch_config, touch_worker
 
     print("=" * 72, flush=True)
     print("  GATK VPS  waiting for tuner updates", flush=True)
     print("=" * 72, flush=True)
     print(f"   worker={worker_id}  MINOS={root}  poll={args.poll}s", flush=True)
+    print("   this machine posts itself so the fleet can assign work", flush=True)
     print("   stop with Ctrl+C", flush=True)
     while True:
         try:
+            if not touch_worker(worker_id):
+                print(
+                    f"   WARNING: worker={worker_id} could not post online status",
+                    flush=True,
+                )
             job = claim_worker_job(worker_id)
             if not job:
                 print(f"   worker={worker_id} waiting for a GATK update ...", flush=True)

@@ -136,3 +136,13 @@ left join public.gatk_evaluations e on e.config_id = c.id
 group by c.id;
 
 grant select on public.gatk_config_scores to anon, authenticated, service_role;
+
+-- A GATK VPS posts one row when main.py is running. The fleet reads this
+-- list, so a new machine is used without editing TUNER_WORKERS or restarting.
+create table if not exists public.gatk_workers (
+  worker_id  text primary key,
+  last_seen  timestamptz not null default now(),
+  status     text not null default 'online'
+);
+
+grant select, insert, update on public.gatk_workers to anon, authenticated, service_role;
