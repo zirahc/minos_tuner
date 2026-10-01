@@ -202,11 +202,12 @@ def choose_category(report: Mapping[str, Any]) -> Tuple[str, str, str]:
             f"full-config pass starts at {first}; the other parameters stay at the best config",
             "explore",
         )
-    open_name = report.get("open_experiment")
-    if isinstance(open_name, str) and open_name.startswith("v2_"):
+    best = report.get("best_avg_combined_final")
+    if isinstance(best, float) and best < NANO_AT:
         return (
-            open_name,
-            f"continue {open_name} until it has {EXHAUST_MIN_TRIALS} scores",
+            order[0],
+            "best score is below 0.88; build a large experiment from history "
+            "instead of another category screen. The target is 0.9",
             "experiment",
         )
     needs = report.get("needs_screen") if isinstance(report.get("needs_screen"), dict) else {}
@@ -277,23 +278,13 @@ def _v2_experiment(
     Terms are core, indel, snp, and fp. A finished experiment is followed
     by a different term. Parameters stay inside that term.
     """
-    open_name = _open_v2_experiment(history)
-    if open_name:
-        parsed = _keys_from_experiment(open_name)
-        if parsed:
-            loss, keys = parsed
-            space = _term_space(history, keys, _phase(report))
-            if _searchable(space):
-                return (
-                    open_name,
-                    space,
-                    f"continue {open_name}; it is still the v2 experiment for {loss}",
-                )
     ranked = _ranked_movers(history)
-    if not ranked:
-        return None
     losses = report.get("losses") if isinstance(report.get("losses"), dict) else {}
     phase = _phase(report)
+    if phase == "leap":
+        return _leap_experiment(history, ranked, losses)
+    if not ranked:
+        return None
     for loss in _term_rotation(losses, _latest_v2_term(history)):
         ordered = [
             item for item in ranked
@@ -307,7 +298,7 @@ def _v2_experiment(
                 continue
             keys = [item[1] for item in picked]
             name = _experiment_name(loss, keys)
-            if _experiment_done(history, name):
+            if _experiment_seen(history, name):
                 continue
             space = _term_space(history, keys, phase)
             if not _searchable(space):
@@ -319,6 +310,83 @@ def _v2_experiment(
                 reason += " Nano range around the best config."
             return name, space, reason
     return None
+
+
+def _leap_experiment(
+    history: Sequence[Mapping[str, Any]],
+    ranked: Sequence[Tuple[float, str, ParamSpec, Dict[str, List[float]]]],
+    losses: Mapping[str, Any],
+) -> Optional[Tuple[str, Dict[str, Any], str]]:
+    """A wide combination. Not one classic category, and not a repeat of a used name.
+
+    The same keys may be searched again later with different values. That
+    choice belongs to the review step, which can see the scored settings.
+    """
+    ordered = _leap_candidates(ranked, losses)
+    if not ordered:
+        return None
+    loss = _largest_term(losses)
+    cap = 6
+    fallback: Optional[Tuple[str, Dict[str, Any], str]] = None
+    for start in range(0, len(ordered), cap):
+        picked = list(ordered[start : start + cap])
+        if not picked:
+            continue
+        keys = [item[1] for item in picked]
+        name = _experiment_name(loss, keys)
+        space = _term_space(history, keys, "leap")
+        if not _searchable(space):
+            continue
+        reason = _experiment_reason(loss, losses.get(loss), picked)
+        reason += (
+            " Full coarse range across the parameters that can still move the score."
+            " The target is 0.9, so this is a large change, not a one-category screen."
+            " A setting already in history is not repeated."
+            " The same experiment with different values is allowed."
+        )
+        if fallback is None:
+            fallback = (name, space, reason)
+        if _experiment_seen(history, name):
+            continue
+        return name, space, reason
+    return fallback
+
+
+def _leap_candidates(
+    ranked: Sequence[Tuple[float, str, ParamSpec, Dict[str, List[float]]]],
+    losses: Mapping[str, Any],
+) -> List[Tuple[float, str, ParamSpec, Dict[str, List[float]]]]:
+    """Movers first, then the other catalog keys of every term that still has points."""
+    terms = _available_terms(losses) or ["core", "indel", "snp", "fp"]
+    ordered: List[Tuple[float, str, ParamSpec, Dict[str, List[float]]]] = []
+    seen = set()
+    for loss in terms:
+        groups = _loss_categories(loss)
+        for item in ranked:
+            key = item[1]
+            if key in seen or category_of(key) not in groups:
+                continue
+            seen.add(key)
+            ordered.append(item)
+    for loss in terms:
+        for name in _loss_categories(loss):
+            for key, spec in space_for(name).items():
+                if key in seen:
+                    continue
+                seen.add(key)
+                ordered.append((0.0, key, spec, {}))
+    return ordered
+
+
+def _largest_term(losses: Mapping[str, Any]) -> str:
+    best_key = "core"
+    best_value: Optional[float] = None
+    for key in ("core", "indel", "snp", "fp"):
+        value = losses.get(key)
+        if isinstance(value, float) and (best_value is None or value > best_value):
+            best_value = value
+            best_key = key
+    return best_key
 
 
 def _phase(report: Mapping[str, Any]) -> str:
@@ -503,6 +571,11 @@ def _open_v2_experiment(history: Sequence[Mapping[str, Any]]) -> Optional[str]:
             return None
         return name
     return None
+
+
+def _experiment_seen(history: Sequence[Mapping[str, Any]], name: str) -> bool:
+    """True when this experiment name already has a row. Different values may reuse it."""
+    return any(str(row.get("search_category") or "").strip() == name for row in history)
 
 
 def _experiment_done(history: Sequence[Mapping[str, Any]], name: str) -> bool:

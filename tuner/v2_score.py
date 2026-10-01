@@ -36,10 +36,10 @@ Points still on the table from the best row:
   fp_loss    = 0.30 * (1 - exp(-fp_per_target / 8))
 A parameter changes avg_combined_final only by moving core F1 or fp_per_target.
 Read the parameter note for which of those it moves, and in which direction.
-Open the one category whose notes attack the largest loss.
-indel_loss: pcr, then assembly, pair_hmm, priors.
-fp_loss: quality_filters, then calling_confidence, pair_hmm, priors, downsampling.
-snp_loss: active_region, then calling_confidence, assembly, priors, quality_filters.
+While the best score is below 0.88, combine parameters from several of these groups in one experiment. A single classic category is not enough to reach 0.9.
+indel_loss: pcr, assembly, pair_hmm, priors.
+fp_loss: quality_filters, calling_confidence, pair_hmm, priors, downsampling.
+snp_loss: active_region, calling_confidence, assembly, priors, quality_filters.
 The hypothesis must name that metric and the direction you will move the parameter.
 """
 

@@ -32,10 +32,15 @@ try:
 except ImportError:
     pass
 
-from tuner.search_box import enough_trials, specs_to_space_json, validate_search_box, write_search_box
-from tuner.spaces import agent_reference, category_instruction
-from tuner.spaces import space_for
-from tuner.steps import multistep_search_box
+from tuner.search_box import (
+    MAX_TRIALS,
+    enough_trials,
+    specs_to_space_json,
+    validate_search_box,
+    write_search_box,
+)
+from tuner.spaces import SPACES, agent_reference, category_instruction, space_for
+from tuner.steps import _keys_from_experiment, multistep_search_box
 from tuner.supabase_scores import fetch_config_scores
 from tuner.v2_score import V2_BRIEF
 
@@ -50,19 +55,19 @@ You do not tune a live miner. You only choose a category and bounds.
 {v2}
 
 Rules:
-- Optimize avg_combined_final by attacking the largest v2 point loss.
-- Open exactly one search_category from the catalog.
-- space keys must be a subset of that category. Do not add other GATK keys.
+- Optimize avg_combined_final. The target is 0.9.
+- Study the history. Do not repeat a setting already scored there.
+- The same experiment with different parameter values is acceptable.
+- While the best score is below 0.88, make a large change: several catalog parameters, full coarse ranges, from more than one category if one category is stuck.
+- A new experiment name starts with v2_ and lists its keys: v2_{{term}}__{{key}}__{{key}}. term is core, indel, snp, or fp.
 - Numeric values use the coarse step in the catalog. Do not ask for adjacent values such as 32, 34, 36 on a 30-100 range.
 - Categorical choices must be the full catalog list. Optuna cannot change that list later.
-- A new experiment is not a catalog category. Its name starts with v2_ and its parameters belong to one v2 term: core, indel, snp, or fp. The schedule rotates through every term that still has points left. Do not add parameters that are not already in the draft.
+- Keys must already exist in the catalog. Do not invent GATK flags.
 - Each parameter note names the v2 metric it moves. The hypothesis must name that metric and the direction.
-- Search only keys in the chosen category.
-- n_trials is the product of every parameter in this search, from 1 to 90.
+- n_trials is the product of every parameter in this search, from 1 to {max_trials}.
 - One integer range of 30 to 100 is 70 trials.
 - When several parameters are searched together, multiply. 4 PCR models times another parameter's count. Do not leave that search at 4.
-- A search that only varies the 4 PCR models uses 4 trials. Do not set n_trials above 90.
-- One category per round.
+- A search that only varies the 4 PCR models uses 4 trials. Do not set n_trials above {max_trials}.
 - Failed / missing scores are not a GATK failure; ignore them for ranking.
 - Write a short hypothesis that a later review can confirm or reject.
 
@@ -70,29 +75,30 @@ Return ONLY a JSON object with keys:
   search_category, hypothesis, space, constraints, n_trials, optimize
 optimize must be "avg_combined_final".
 constraints may include min_avg_f1_snp, min_avg_f1_indel, min_avg_combined_final.
-""".format(v2=V2_BRIEF.strip())
+""".format(v2=V2_BRIEF.strip(), max_trials=MAX_TRIALS)
 
 REVIEW_PROMPT = """You revise ONE Optuna search box for Minos GATK practice tuning.
 
 {v2}
 
-You are given a diagnosis and a draft box already chosen by a fixed 4-step policy:
-diagnose which v2 component leaves the most points on the table, review the last
-category, choose the next category, tighten bounds around the best trials.
+You are given the scored history, a diagnosis, and a draft box.
+The draft is a starting point. Replace it when history shows a larger experiment
+will move avg_combined_final toward 0.9.
 
-Keep the draft unless the diagnosis shows a clear mistake.
-Do not change search_category. The schedule already picked the category or the v2 experiment; the other parameters stay at the best config.
-If the draft bounds are the full coarse range, the score is still below 0.88. Do not shrink that range. Nano bounds are only for a score of 0.88 or higher.
-If search_category is not a catalog category, keep only parameters already in the draft, and keep the coarse steps. Do not add a 1 or 2 unit change on a wide range. The draft raises one v2 term. Do not switch it to a different term.
-You may change space bounds, n_trials (1..90), hypothesis, or constraints.
-n_trials is the product of the parameters being varied. 70 is acceptable for one 30..100 range.
-4 PCR models times another parameter is more than 4. Cap the product at 90.
-Stay inside the catalog. Use each parameter note's v2 metric. The hypothesis must name that metric and the direction. Do not add keys from another category.
+Study the history before you answer. Each history row's varied map is a setting that was already run. Do not propose that same setting again.
+The same experiment with different parameter values is acceptable. Prefer a new combination when the old values did not raise avg_combined_final.
+The target is 0.9. While the best score is below 0.88, make a large change: several catalog parameters at once, on their full coarse ranges, from more than one category when one category is stuck. Do not stay on a classic single-category screen, and do not shrink a full coarse range.
+You may change search_category, the keys in space, the bounds, n_trials (1..{max_trials}), hypothesis, and constraints.
+A new experiment name starts with v2_ and lists its keys: v2_{{term}}__{{key}}__{{key}}. term is core, indel, snp, or fp.
+Keys must already exist in the catalog. Use each key's coarse step. Do not invent flags. Do not ask for a 1 or 2 unit change on a wide range.
+At 0.88 or above, narrow the range around the best scored values.
+n_trials is the product of the parameters being varied. Cap the product at {max_trials}.
+The hypothesis must name the v2 metric and the direction.
 optimize must stay "avg_combined_final".
 
 Return ONLY a JSON object with keys:
   search_category, hypothesis, space, constraints, n_trials, optimize
-""".format(v2=V2_BRIEF.strip())
+""".format(v2=V2_BRIEF.strip(), max_trials=MAX_TRIALS)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -137,7 +143,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         source = "steps"
         if _has_llm_key() and not args.no_review:
             try:
-                revised = validate_search_box(_llm_review(report, box))
+                revised = validate_search_box(_llm_review(report, box, history))
             except (ValueError, RuntimeError) as e:
                 print(f"   step 5 review rejected ({e}); keeping the draft", flush=True)
             else:
@@ -275,15 +281,45 @@ def _print_report(report: Dict[str, Any]) -> None:
     )
 
 
-def _llm_review(report: Dict[str, Any], draft: Dict[str, Any]) -> Dict[str, Any]:
+def _setting_brief(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Scored settings the next experiment must not repeat."""
+    brief: List[Dict[str, Any]] = []
+    for row in rows[-HISTORY_LIMIT:]:
+        name = str(row.get("search_category") or "")
+        updates = row.get("gatk_updates") if isinstance(row.get("gatk_updates"), dict) else {}
+        parsed = _keys_from_experiment(name)
+        if parsed:
+            varied = {key: updates[key] for key in parsed[1] if key in updates}
+        elif name in SPACES:
+            varied = {key: updates[key] for key in SPACES[name] if key in updates}
+        else:
+            varied = {}
+        brief.append({
+            "search_category": name,
+            "experiment": row.get("experiment"),
+            "status": row.get("status"),
+            "avg_combined_final": row.get("avg_combined_final"),
+            "avg_core": row.get("avg_core"),
+            "avg_germline": row.get("avg_germline"),
+            "avg_fp_per_target": row.get("avg_fp_per_target"),
+            "varied": varied,
+        })
+    return brief
+
+
+def _llm_review(
+    report: Dict[str, Any], draft: Dict[str, Any], history: List[Dict[str, Any]]
+) -> Dict[str, Any]:
     user = json.dumps(
         {
             "catalog": agent_reference(),
             "diagnosis": report,
+            "history": _setting_brief(history),
             "draft": draft,
             "instruction": (
-                "Revise the draft only if the diagnosis or the parameter notes "
-                "show a mistake. Return JSON only."
+                "Study the history. Propose a large experiment that does not "
+                "repeat a varied setting already scored. The same experiment "
+                "with different values is allowed. Return JSON only."
             ),
         },
         default=str,
@@ -326,7 +362,7 @@ def _anthropic_chat(system: str, user: str) -> str:
     model = (os.environ.get("ANTHROPIC_MODEL") or "claude-sonnet-4-6").strip()
     body = {
         "model": model,
-        "max_tokens": 1500,
+        "max_tokens": 2500,
         "system": system,
         "messages": [{"role": "user", "content": user}],
     }

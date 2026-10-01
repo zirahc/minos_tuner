@@ -40,7 +40,9 @@ from tuner.adapter import (
     catalog_categorical_distributions,
     import_rows,
     open_study,
+    param_signature,
     reconcile_categorical_study,
+    remember_scores,
 )
 from tuner.agent import main as agent_main
 from tuner.jobs import (
@@ -55,8 +57,16 @@ from tuner.jobs import (
     requeue_confirmation,
 )
 from tuner.search_box import MAX_TRIALS, load_search_box, optuna_distributions
-from tuner.spaces import best_base_updates, categories_touched, default_study_name, is_agent_experiment
-from tuner.steps import MIN_GAIN
+from tuner.spaces import (
+    best_base_updates,
+    categories_touched,
+    category_of,
+    coerce_param,
+    default_study_name,
+    is_agent_experiment,
+    spec_of,
+)
+from tuner.steps import MIN_GAIN, _row_informs_param
 from tuner.supabase_scores import fetch_config_scores
 
 DEFAULT_BOX = TUNER_ROOT / "search_box.json"
@@ -331,13 +341,15 @@ def _build_stack(args: argparse.Namespace) -> bool:
     study = reconcile_categorical_study(
         study, optuna, study_name, storage, distributions
     )
-    history = fetch_config_scores(category=None, scored_only=True)
-    if history is None:
+    past = fetch_config_scores(category=None, scored_only=False)
+    if past is None:
         return False
+    history = [row for row in past if _score_of(row) is not None]
+    space_keys = list(box["space"])
     if is_agent_experiment(category):
         print(
             f"   {category}: varying "
-            + ", ".join(box["space"])
+            + ", ".join(space_keys)
             + "; other parameters stay at the best config",
             flush=True,
         )
@@ -350,7 +362,7 @@ def _build_stack(args: argparse.Namespace) -> bool:
             flush=True,
         )
         added, skipped = import_rows(
-            study, matched, category, distributions, optuna, keys=list(box["space"])
+            study, matched, category, distributions, optuna, keys=space_keys
         )
     print(f"   warm-start imported={added} skipped={skipped}", flush=True)
     _settle_running(study, study_name, TrialState)
@@ -366,23 +378,52 @@ def _build_stack(args: argparse.Namespace) -> bool:
             study, optuna, study_name, storage, distributions
         )
 
+    known = _known_settings(study, past, space_keys)
+    if is_agent_experiment(category):
+        remembered = remember_scores(
+            study,
+            [(params, score) for params, score in known.values() if score is not None],
+            distributions,
+            optuna,
+        )
+        if remembered:
+            print(f"   remembered {remembered} scored setting(s) from history", flush=True)
+            known = _known_settings(study, past, space_keys)
+    print(
+        f"   history already contains {len(known)} setting(s); those trials are skipped",
+        flush=True,
+    )
+
     budget = max(1, min(MAX_TRIALS, int(box.get("n_trials") or 1)))
     distinct = _distinct_settings(box["space"])
-    target = budget if distinct is None else min(budget, distinct)
+    fresh: List[Dict[str, Any]] = []
     if distinct is not None and distinct < budget:
+        fresh = [
+            params for params in _enumerate_settings(box["space"])
+            if param_signature(params) not in known
+        ]
+        target = min(budget, len(fresh))
         print(
-            f"   {category} has {distinct} setting(s); stack uses {target} "
-            "so the same option is not scored twice",
+            f"   {category} has {distinct} setting(s), {len(fresh)} not in history; "
+            f"stack uses {target}",
             flush=True,
         )
-        for params in _enumerate_settings(box["space"]):
+        for params in fresh[:target]:
             try:
                 study.enqueue_trial(params)
             except Exception as e:  # noqa: BLE001
                 print(f"   WARNING: could not enqueue {params}: {e}", flush=True)
                 break
     else:
+        target = budget
         print(f"   stack target={target}", flush=True)
+    if target <= 0:
+        print(
+            "   every setting in this experiment is already in history; "
+            "the agent will choose different parameters",
+            flush=True,
+        )
+        return False
 
     best_rows = fetch_config_scores(
         category=None,
@@ -403,7 +444,6 @@ def _build_stack(args: argparse.Namespace) -> bool:
 
     batch_id = str(uuid.uuid4())
     placed = 0
-    seen = set()
     attempts = 0
     while placed < target and attempts < target * 4:
         attempts += 1
@@ -417,11 +457,20 @@ def _build_stack(args: argparse.Namespace) -> bool:
             print(f"   ERROR: {e}", flush=True)
             return False
         params = dict(trial.params)
-        signature = tuple(sorted((key, str(value)) for key, value in params.items()))
-        if signature in seen:
-            _tell_state(study, trial.number, TrialState.FAIL)
+        signature = param_signature(params)
+        if signature in known:
+            previous = known[signature][1]
+            if previous is not None:
+                _tell_state(study, trial.number, None, previous)
+                print(
+                    f"   skip trial={trial.number} already scored {previous:.4f} {params}",
+                    flush=True,
+                )
+            else:
+                _tell_state(study, trial.number, TrialState.FAIL)
+                print(f"   skip trial={trial.number} already tried {params}", flush=True)
             continue
-        seen.add(signature)
+        known[signature] = (params, None)
         updates = dict(base)
         updates.update(params)
         experiment = f"optuna-{category}-t{trial.number}"
@@ -452,6 +501,87 @@ def _build_stack(args: argparse.Namespace) -> bool:
         return False
     print(f"   placed {placed} trial(s) on the stack", flush=True)
     return True
+
+
+def _known_settings(
+    study: Any,
+    history: List[Dict[str, Any]],
+    keys: List[str],
+) -> Dict[tuple, tuple]:
+    """Settings already stored for these keys.
+
+    The value is (params, score). Score is None when the trial failed or is
+    still open. A row counts only when every key was part of that experiment,
+    so a held base value is not treated as a finished trial.
+    """
+    known: Dict[tuple, tuple] = {}
+    cache: Dict[str, set] = {}
+    for row in history:
+        if not keys or not all(
+            _row_informs_param(history, row, key, category_of(key), cache) for key in keys
+        ):
+            continue
+        params = _params_for_keys(row, keys)
+        if params is None:
+            continue
+        _remember_setting(known, params, _score_of(row))
+    for trial in study.get_trials(deepcopy=False):
+        raw = dict(getattr(trial, "params", None) or {})
+        if not raw or any(key not in raw for key in keys):
+            continue
+        params = {key: raw[key] for key in keys}
+        score = None
+        if getattr(trial.state, "name", "") == "COMPLETE":
+            try:
+                score = float(trial.value)
+            except (TypeError, ValueError):
+                score = None
+            if score is not None and not math.isfinite(score):
+                score = None
+        _remember_setting(known, params, score)
+    return known
+
+
+def _remember_setting(
+    known: Dict[tuple, tuple], params: Dict[str, Any], score: Optional[float]
+) -> None:
+    signature = param_signature(params)
+    previous = known.get(signature)
+    if previous is None or (previous[1] is None and score is not None):
+        known[signature] = (params, score)
+
+
+def _params_for_keys(row: Dict[str, Any], keys: List[str]) -> Optional[Dict[str, Any]]:
+    updates = row.get("gatk_updates") if isinstance(row.get("gatk_updates"), dict) else {}
+    config = row.get("gatk_config") if isinstance(row.get("gatk_config"), dict) else {}
+    params: Dict[str, Any] = {}
+    for key in keys:
+        spec = spec_of(key)
+        if spec is None:
+            return None
+        if key not in updates and key not in config:
+            return None
+        raw = updates[key] if key in updates else config[key]
+        try:
+            if spec.kind == "categorical":
+                params[key] = coerce_param(spec, raw)
+            elif spec.kind == "int":
+                params[key] = int(round(float(raw)))
+            else:
+                params[key] = float(raw)
+        except (TypeError, ValueError):
+            return None
+    return params
+
+
+def _score_of(row: Dict[str, Any]) -> Optional[float]:
+    try:
+        value = float(row.get("avg_combined_final"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return value
 
 
 def _tell_jobs(jobs: List[Dict[str, Any]]) -> int:

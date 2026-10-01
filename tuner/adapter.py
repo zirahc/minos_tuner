@@ -190,6 +190,85 @@ def import_rows(
     return added, skipped
 
 
+def remember_scores(
+    study: Any,
+    scored: List[tuple],
+    distributions: Dict[str, Any],
+    optuna: Any,
+) -> int:
+    """Add completed trials for settings already scored inside this box.
+
+    Each item is (params, score). A value outside the current distributions
+    is skipped so the study range does not change.
+    """
+    from optuna.trial import TrialState, create_trial
+
+    existing = {
+        param_signature(trial.params)
+        for trial in study.get_trials(deepcopy=False)
+        if getattr(trial, "params", None)
+    }
+    added = 0
+    for params, score in scored:
+        if not isinstance(params, dict) or not params:
+            continue
+        try:
+            value = float(score)
+        except (TypeError, ValueError):
+            continue
+        signature = param_signature(params)
+        if signature in existing:
+            continue
+        if any(
+            key not in distributions or not _value_in_distribution(distributions[key], val)
+            for key, val in params.items()
+        ):
+            continue
+        try:
+            trial = create_trial(
+                params=dict(params),
+                distributions={key: distributions[key] for key in params},
+                values=[value],
+                state=TrialState.COMPLETE,
+            )
+            study.add_trial(trial)
+        except (TypeError, ValueError) as e:
+            print(f"   skip remembered setting {params}: {e}", flush=True)
+            continue
+        existing.add(signature)
+        added += 1
+    return added
+
+
+def param_signature(params: Dict[str, Any]) -> tuple:
+    """Stable identity of one trial's parameter values."""
+    return tuple(sorted((str(key), _norm_value(value)) for key, value in params.items()))
+
+
+def _norm_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number == int(number):
+            return str(int(number))
+        return str(number)
+    return str(value)
+
+
+def _value_in_distribution(dist: Any, value: Any) -> bool:
+    kind = dist.__class__.__name__
+    if kind == "CategoricalDistribution":
+        return any(_norm_value(choice) == _norm_value(value) for choice in dist.choices)
+    if kind in ("IntDistribution", "FloatDistribution"):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return False
+        return float(dist.low) - 1e-9 <= number <= float(dist.high) + 1e-9
+    return False
+
+
 def catalog_categorical_distributions(
     category: str,
     distributions: Dict[str, Any],

@@ -384,8 +384,10 @@ def category_instruction(category: str) -> str:
         return CATEGORY_GUIDE[category]
     if str(category or "").startswith("v2_"):
         return (
-            "New experiment for one v2 term that still has points left: core, "
-            "indel, snp, or fp. Other parameters stay at the best config."
+            "Large experiment toward avg_combined_final 0.9. Vary several catalog "
+            "parameters at once. The same experiment with different values is allowed. "
+            "Do not repeat a setting that history already scored. Other parameters "
+            "stay at the best config."
         )
     return ""
 

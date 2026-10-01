@@ -20,8 +20,9 @@ from tuner.spaces import (
 
 ALLOWED_OPTIMIZE = "avg_combined_final"
 MIN_TRIALS = 1
-# An integer span of 70 (30..100) may all be tried. Never more than 90.
-MAX_TRIALS = 90
+# An integer span of 70 (30..100) may all be tried. The product of
+# several parameters may be larger, never more than 500.
+MAX_TRIALS = 500
 
 
 def specs_to_space_json(specs: Mapping[str, ParamSpec]) -> Dict[str, Any]:
@@ -130,7 +131,7 @@ def _param_trials(spec: Mapping[str, Any]) -> int:
 
 
 def enough_trials(space: Mapping[str, Any]) -> int:
-    """Product of each parameter's size. 4 PCR models times another range, capped at 90."""
+    """Product of each parameter's size. 4 PCR models times another range, capped at 500."""
     needed = 1
     for spec in space.values():
         if isinstance(spec, dict):
