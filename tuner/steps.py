@@ -61,6 +61,9 @@ IMPROVE_MARGIN = MIN_GAIN
 EXHAUST_MIN_TRIALS = 4
 SHRINK_MIN_TRIALS = 3
 TOP_K = 3
+# One lucky row cannot decide the side of a range. A setting needs this
+# many scores before it can pull the experiment away from the best config.
+MIN_BIN_ROWS = 3
 
 
 def multistep_search_box(
@@ -337,9 +340,9 @@ def _ranked_movers(
     for specs in SPACES.values():
         for key, spec in specs.items():
             bins = _param_bins(history, key, spec, cache)
-            if len(bins) < 2:
+            means = list(_supported_means(bins).values())
+            if len(means) < 2:
                 continue
-            means = [_mean(values) for values in bins.values()]
             spread = max(means) - min(means)
             if spread > MIN_GAIN:
                 ranked.append((spread, key, spec, bins))
@@ -361,7 +364,12 @@ def _directed_space(
         bins_by_key[key] = _param_bins(history, key, spec, cache)
     space = specs_to_space_json(specs)
     for key, spec in specs.items():
-        space[key] = _directed_item(spec, bins_by_key.get(key) or {}, space[key])
+        space[key] = _directed_item(
+            spec,
+            bins_by_key.get(key) or {},
+            space[key],
+            _best_setting(history, key, spec),
+        )
     return space
 
 
@@ -369,13 +377,16 @@ def _directed_item(
     spec: ParamSpec,
     bins: Mapping[str, Sequence[float]],
     full: Dict[str, Any],
+    anchor: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Keep the catalog grid, but drop the numeric side that scored worse."""
+    """Keep the catalog grid, but drop the numeric side that scored worse.
+
+    The best config's value stays inside the range. A new experiment that
+    excludes it changes every trial, and those trials come back failed.
+    """
     if spec.kind not in ("int", "float") or spec.log or spec.low is None or spec.high is None:
         return full
-    if len(bins) < 2:
-        return full
-    means = {label: _mean(values) for label, values in bins.items() if values}
+    means = _supported_means(bins)
     if len(means) < 2:
         return full
     winner_label = max(means, key=lambda label: means[label])
@@ -400,8 +411,10 @@ def _directed_item(
             low, high = max(catalog_low, winner - step), winner
         else:
             low, high = max(catalog_low, winner - step), min(catalog_high, winner + step)
-    low = max(catalog_low, low)
-    high = min(catalog_high, high)
+    if anchor is not None:
+        low = min(low, float(anchor))
+        high = max(high, float(anchor))
+    low, high = _snap_span(low, high, step, catalog_low, catalog_high)
     if high < low:
         return full
     item = dict(full)
@@ -448,11 +461,78 @@ def _experiment_done(history: Sequence[Mapping[str, Any]], name: str) -> bool:
     return len(rows) >= EXHAUST_MIN_TRIALS
 
 
+def _supported_means(bins: Mapping[str, Sequence[float]]) -> Dict[str, float]:
+    return {
+        label: _mean(values)
+        for label, values in bins.items()
+        if len(values) >= MIN_BIN_ROWS
+    }
+
+
+def _best_setting(
+    history: Sequence[Mapping[str, Any]], key: str, spec: ParamSpec
+) -> Optional[float]:
+    """Snapped value of this parameter on the highest-scoring row."""
+    best_score: Optional[float] = None
+    best_value: Optional[float] = None
+    for row in history:
+        score = _num(row.get("avg_combined_final"))
+        if score is None:
+            continue
+        updates = row.get("gatk_updates") if isinstance(row.get("gatk_updates"), dict) else {}
+        config = row.get("gatk_config") if isinstance(row.get("gatk_config"), dict) else {}
+        if key not in updates and key not in config:
+            continue
+        raw = updates[key] if key in updates else config[key]
+        try:
+            snapped = coerce_param(spec, raw)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(snapped, (bool, str)):
+            continue
+        if best_score is None or score > best_score:
+            best_score = score
+            best_value = float(snapped)
+    return best_value
+
+
+def _snap_span(
+    low: float, high: float, step: float, catalog_low: float, catalog_high: float
+) -> Tuple[float, float]:
+    """Coarse grid points inside the range. Do not pull the range back to a worse end."""
+    low = max(catalog_low, min(catalog_high, low))
+    high = max(catalog_low, min(catalog_high, high))
+    if high < low:
+        return catalog_low, catalog_high
+    if step <= 0:
+        return low, high
+    limit = int(math.floor((catalog_high - catalog_low) / step + 1e-9))
+    inside = []
+    for n in range(limit + 1):
+        value = catalog_low + n * step
+        if low - 1e-9 <= value <= high + 1e-9:
+            inside.append(value)
+    if len(inside) >= 2:
+        return inside[0], inside[-1]
+    if not inside:
+        n = int(round(((low + high) / 2 - catalog_low) / step))
+        n = max(0, min(limit, n))
+        center = catalog_low + n * step
+    else:
+        center = inside[0]
+    neighbors = [center]
+    if center - step >= catalog_low - 1e-9:
+        neighbors.append(center - step)
+    if center + step <= catalog_high + 1e-9:
+        neighbors.append(center + step)
+    return min(neighbors), max(neighbors)
+
+
 def _experiment_reason(loss: str, loss_value: Any, picked: Sequence[Tuple[Any, ...]]) -> str:
     amount = f"{loss_value:.4f}" if isinstance(loss_value, float) else "na"
     directions = []
     for spread, key, _spec, bins in picked:
-        means = {label: _mean(scores) for label, scores in bins.items() if scores}
+        means = _supported_means(bins)
         winner = max(means, key=lambda label: means[label]) if means else "?"
         directions.append(f"{key} toward {winner} (spread {spread:.4f})")
     return (

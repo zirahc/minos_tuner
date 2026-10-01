@@ -354,9 +354,19 @@ def _build_stack(args: argparse.Namespace) -> bool:
         )
     print(f"   warm-start imported={added} skipped={skipped}", flush=True)
     _settle_running(study, study_name, TrialState)
+    if is_agent_experiment(category) and _only_failed_trials(study, TrialState):
+        print(
+            f"   {category} has no scored trial; rebuilding the study "
+            "on the coarse grid",
+            flush=True,
+        )
+        study = open_study(optuna, study_name, storage, reset=True)
+        study = reconcile_categorical_study(
+            study, optuna, study_name, storage, distributions
+        )
 
     budget = max(1, min(MAX_TRIALS, int(box.get("n_trials") or 1)))
-    distinct = _fixed_choice_count(box["space"])
+    distinct = _distinct_settings(box["space"])
     target = budget if distinct is None else min(budget, distinct)
     if distinct is not None and distinct < budget:
         print(
@@ -524,6 +534,17 @@ def _tell_state(study: Any, number: int, state: Any = None, value: Optional[floa
             study.tell(int(number), value)
     except Exception as e:  # noqa: BLE001
         print(f"   WARNING: tell trial={number} failed: {e}", flush=True)
+
+
+def _only_failed_trials(study: Any, trial_state: Any) -> bool:
+    """True when every stored trial failed and none are still running."""
+    trials = study.get_trials(deepcopy=False)
+    if not trials:
+        return False
+    for trial in trials:
+        if trial.state in (trial_state.COMPLETE, trial_state.RUNNING, trial_state.WAITING):
+            return False
+    return True
 
 
 def _fixed_choice_count(space: Dict[str, Any]) -> Optional[int]:
