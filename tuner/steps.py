@@ -22,7 +22,7 @@ from tuner.spaces import (
     space_for,
     spec_of,
 )
-from tuner.v2_score import component_losses
+from tuner.v2_score import MIN_LOSS, component_losses
 
 # Order is the next lever for that limiter. A plateaued category is skipped.
 BOTTLENECK_PLAN: Dict[str, Tuple[str, ...]] = {
@@ -54,8 +54,10 @@ BOTTLENECK_PLAN: Dict[str, Tuple[str, ...]] = {
     ),
 }
 
+# Below this, search the full coarse range. At this score, tighten around the best.
+NANO_AT = 0.88
 # A category that does not beat the current best by more than this
-# is not given more trials. The first goal is to move 0.75 toward 0.9.
+# is not given more trials.
 MIN_GAIN = 0.01
 IMPROVE_MARGIN = MIN_GAIN
 EXHAUST_MIN_TRIALS = 4
@@ -84,10 +86,11 @@ def multistep_search_box(
             space = specs_to_space_json(space_for(category))
         else:
             category, space, reason = built
+    phase = _phase(report)
     scored = _rows_for_category(history, category) if mode != "experiment" else []
-    shrink = mode == "refine" and len(scored) >= SHRINK_MIN_TRIALS
+    shrink = phase == "nano" and mode == "refine" and len(scored) >= SHRINK_MIN_TRIALS
     if mode != "experiment":
-        space = _space_json(category, scored if shrink else [])
+        space = specs_to_space_json(space_for(category)) if phase == "leap" else _space_json(category, scored if shrink else [])
     if shrink and not _searchable(space):
         category, reason, mode = _next_searchable(report, category)
         scored = _rows_for_category(history, category)
@@ -95,8 +98,10 @@ def multistep_search_box(
         space = _space_json(category, scored if shrink else [])
         if not _searchable(space):
             space = specs_to_space_json(space_for(category))
-    if is_agent_experiment(category):
-        bounds = "directed"
+    if phase == "leap":
+        bounds = "leap"
+    elif is_agent_experiment(category):
+        bounds = "nano"
     else:
         bounds = "shrunk" if space != specs_to_space_json(space_for(category)) else "full"
     n_trials = enough_trials(space)
@@ -215,8 +220,8 @@ def choose_category(report: Mapping[str, Any]) -> Tuple[str, str, str]:
             )
     return (
         order[0],
-        "category screens are done; the next experiment comes from the largest "
-        "v2 loss and the settings that raised avg_combined_final",
+        "category screens are done; the next experiment takes the next v2 term "
+        "that still has points left",
         "experiment",
     )
 
@@ -267,17 +272,17 @@ def _v2_experiment(
     history: Sequence[Mapping[str, Any]],
     report: Mapping[str, Any],
 ) -> Optional[Tuple[str, Dict[str, Any], str]]:
-    """A new experiment aimed at the largest v2 loss.
+    """One new experiment for the next v2 term that still has points left.
 
-    Parameters are catalog settings whose history values already separated
-    avg_combined_final. Numeric ranges sit on the side that scored higher.
+    Terms are core, indel, snp, and fp. A finished experiment is followed
+    by a different term. Parameters stay inside that term.
     """
     open_name = _open_v2_experiment(history)
     if open_name:
         parsed = _keys_from_experiment(open_name)
         if parsed:
             loss, keys = parsed
-            space = _directed_space(history, keys)
+            space = _term_space(history, keys, _phase(report))
             if _searchable(space):
                 return (
                     open_name,
@@ -288,40 +293,82 @@ def _v2_experiment(
     if not ranked:
         return None
     losses = report.get("losses") if isinstance(report.get("losses"), dict) else {}
-    for loss in _loss_priority(losses):
-        preferred = set(_loss_categories(loss))
-        ordered = [item for item in ranked if category_of(item[1]) in preferred]
-        ordered.extend(item for item in ranked if category_of(item[1]) not in preferred)
-        if not any(category_of(item[1]) in preferred for item in ordered):
+    phase = _phase(report)
+    for loss in _term_rotation(losses, _latest_v2_term(history)):
+        ordered = [
+            item for item in ranked
+            if category_of(item[1]) in _loss_categories(loss)
+        ]
+        if not ordered:
             continue
         for start in range(len(ordered)):
             picked = ordered[start : start + 4]
-            if not picked or not any(category_of(item[1]) in preferred for item in picked):
+            if not picked:
                 continue
             keys = [item[1] for item in picked]
             name = _experiment_name(loss, keys)
             if _experiment_done(history, name):
                 continue
-            space = _directed_space(history, keys)
+            space = _term_space(history, keys, phase)
             if not _searchable(space):
                 continue
-            return name, space, _experiment_reason(loss, losses.get(loss), picked)
+            reason = _experiment_reason(loss, losses.get(loss), picked)
+            if phase == "leap":
+                reason += " Full coarse range. The score is still below 0.88; the target is 0.9."
+            else:
+                reason += " Nano range around the best config."
+            return name, space, reason
     return None
 
 
-def _loss_priority(losses: Mapping[str, Any]) -> List[str]:
-    named = []
-    for key in ("indel", "fp", "snp"):
+def _phase(report: Mapping[str, Any]) -> str:
+    best = report.get("best_avg_combined_final")
+    if isinstance(best, float) and best >= NANO_AT:
+        return "nano"
+    return "leap"
+
+
+def _term_space(
+    history: Sequence[Mapping[str, Any]], keys: Sequence[str], phase: str
+) -> Dict[str, Any]:
+    """Leap uses the whole coarse catalog. Nano stays next to the best value."""
+    if phase == "nano":
+        return _directed_space(history, keys)
+    specs: Dict[str, ParamSpec] = {}
+    for key in keys:
+        spec = spec_of(key)
+        if spec is not None:
+            specs[key] = spec
+    return specs_to_space_json(specs)
+
+
+def _available_terms(losses: Mapping[str, Any]) -> List[str]:
+    """core, indel, snp, and fp, when that term still has points left."""
+    found = []
+    for key in ("core", "indel", "snp", "fp"):
         value = losses.get(key)
-        if isinstance(value, float):
-            named.append((value, key))
-    named.sort(reverse=True)
-    order = [key for _value, key in named]
-    largest = losses.get("largest")
-    if isinstance(largest, str) and largest in order:
-        order.remove(largest)
-        order.insert(0, largest)
-    return order or ["indel", "fp", "snp"]
+        if isinstance(value, float) and value >= MIN_LOSS:
+            found.append(key)
+    return found
+
+
+def _term_rotation(losses: Mapping[str, Any], latest: Optional[str]) -> List[str]:
+    """Next term first, then the rest. Do not repeat the term just finished."""
+    terms = _available_terms(losses)
+    if not terms:
+        return []
+    if latest not in terms:
+        return terms
+    start = (terms.index(latest) + 1) % len(terms)
+    return terms[start:] + terms[:start]
+
+
+def _latest_v2_term(history: Sequence[Mapping[str, Any]]) -> Optional[str]:
+    for row in reversed(list(history)):
+        parsed = _keys_from_experiment(str(row.get("search_category") or "").strip())
+        if parsed:
+            return parsed[0]
+    return None
 
 
 def _loss_categories(loss: str) -> Tuple[str, ...]:
@@ -329,6 +376,12 @@ def _loss_categories(loss: str) -> Tuple[str, ...]:
         return BOTTLENECK_PLAN["false_positives"]
     if loss == "snp":
         return BOTTLENECK_PLAN["sensitivity"]
+    if loss == "core":
+        found: List[str] = []
+        for name in BOTTLENECK_PLAN["indel"] + BOTTLENECK_PLAN["sensitivity"]:
+            if name not in found:
+                found.append(name)
+        return tuple(found)
     return BOTTLENECK_PLAN["indel"]
 
 

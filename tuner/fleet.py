@@ -354,10 +354,11 @@ def _build_stack(args: argparse.Namespace) -> bool:
         )
     print(f"   warm-start imported={added} skipped={skipped}", flush=True)
     _settle_running(study, study_name, TrialState)
-    if is_agent_experiment(category) and _only_failed_trials(study, TrialState):
+    if is_agent_experiment(category) and not _trials_in_flight(study, TrialState) and (
+        _only_failed_trials(study, TrialState) or _stored_range_is_narrower(study, distributions)
+    ):
         print(
-            f"   {category} has no scored trial; rebuilding the study "
-            "on the coarse grid",
+            f"   {category}: rebuilding the study on the current range",
             flush=True,
         )
         study = open_study(optuna, study_name, storage, reset=True)
@@ -534,6 +535,29 @@ def _tell_state(study: Any, number: int, state: Any = None, value: Optional[floa
             study.tell(int(number), value)
     except Exception as e:  # noqa: BLE001
         print(f"   WARNING: tell trial={number} failed: {e}", flush=True)
+
+
+def _trials_in_flight(study: Any, trial_state: Any) -> bool:
+    return any(
+        trial.state in (trial_state.RUNNING, trial_state.WAITING)
+        for trial in study.get_trials(deepcopy=False)
+    )
+
+
+def _stored_range_is_narrower(study: Any, distributions: Dict[str, Any]) -> bool:
+    """True when this study was built on a tighter range than the new box."""
+    for trial in study.get_trials(deepcopy=False):
+        stored = getattr(trial, "distributions", None) or {}
+        if not stored:
+            continue
+        for key, dist in distributions.items():
+            old = stored.get(key)
+            if old is None or not hasattr(old, "low") or not hasattr(dist, "low"):
+                continue
+            if float(old.low) > float(dist.low) + 1e-9 or float(old.high) < float(dist.high) - 1e-9:
+                return True
+        return False
+    return False
 
 
 def _only_failed_trials(study: Any, trial_state: Any) -> bool:

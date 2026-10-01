@@ -55,7 +55,7 @@ Rules:
 - space keys must be a subset of that category. Do not add other GATK keys.
 - Numeric values use the coarse step in the catalog. Do not ask for adjacent values such as 32, 34, 36 on a 30-100 range.
 - Categorical choices must be the full catalog list. Optuna cannot change that list later.
-- A new experiment is not a catalog category. Its name starts with v2_ and its parameters are the ones history already showed can raise avg_combined_final on the largest v2 loss. Do not add parameters that are not already in the draft.
+- A new experiment is not a catalog category. Its name starts with v2_ and its parameters belong to one v2 term: core, indel, snp, or fp. The schedule rotates through every term that still has points left. Do not add parameters that are not already in the draft.
 - Each parameter note names the v2 metric it moves. The hypothesis must name that metric and the direction.
 - Search only keys in the chosen category.
 - n_trials is the product of every parameter in this search, from 1 to 90.
@@ -82,7 +82,8 @@ category, choose the next category, tighten bounds around the best trials.
 
 Keep the draft unless the diagnosis shows a clear mistake.
 Do not change search_category. The schedule already picked the category or the v2 experiment; the other parameters stay at the best config.
-If search_category is not a catalog category, keep only parameters already in the draft, and keep the coarse steps. Do not add a 1 or 2 unit change on a wide range. The draft exists to raise avg_combined_final on the largest v2 loss.
+If the draft bounds are the full coarse range, the score is still below 0.88. Do not shrink that range. Nano bounds are only for a score of 0.88 or higher.
+If search_category is not a catalog category, keep only parameters already in the draft, and keep the coarse steps. Do not add a 1 or 2 unit change on a wide range. The draft raises one v2 term. Do not switch it to a different term.
 You may change space bounds, n_trials (1..90), hypothesis, or constraints.
 n_trials is the product of the parameters being varied. 70 is acceptable for one 30..100 range.
 4 PCR models times another parameter is more than 4. Cap the product at 90.

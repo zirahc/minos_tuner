@@ -384,9 +384,8 @@ def category_instruction(category: str) -> str:
         return CATEGORY_GUIDE[category]
     if str(category or "").startswith("v2_"):
         return (
-            "New experiment chosen from the largest v2 loss and the history "
-            "settings that raised avg_combined_final. Other parameters stay "
-            "at the best config."
+            "New experiment for one v2 term that still has points left: core, "
+            "indel, snp, or fp. Other parameters stay at the best config."
         )
     return ""
 
