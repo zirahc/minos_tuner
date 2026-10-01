@@ -64,10 +64,9 @@ Rules:
 - Categorical choices must be the full catalog list. Optuna cannot change that list later.
 - Keys must already exist in the catalog. Do not invent GATK flags.
 - Each parameter note names the v2 metric it moves. The hypothesis must name that metric and the direction.
-- n_trials is the product of every parameter in this search, from 1 to {max_trials}.
-- One integer range of 30 to 100 is 70 trials.
-- When several parameters are searched together, multiply. 4 PCR models times another parameter's count. Do not leave that search at 4.
-- A search that only varies the 4 PCR models uses 4 trials. Do not set n_trials above {max_trials}.
+- n_trials is the product of the coarse grid, not the raw high-low span. Step 10 from 10 to 50 is 5 trials.
+- When several parameters are searched together, multiply those grid sizes. 4 PCR models times another parameter's grid. Do not leave that search at 4.
+- {max_trials} is the maximum. Use the smaller product when the grid is smaller. Do not set {max_trials} unless the product is at least {max_trials}.
 - Failed / missing scores are not a GATK failure; ignore them for ranking.
 - Write a short hypothesis that a later review can confirm or reject.
 
@@ -92,7 +91,7 @@ You may change search_category, the keys in space, the bounds, n_trials (1..{max
 A new experiment name starts with v2_ and lists its keys: v2_{{term}}__{{key}}__{{key}}. term is core, indel, snp, or fp.
 Keys must already exist in the catalog. Use each key's coarse step. Do not invent flags. Do not ask for a 1 or 2 unit change on a wide range.
 At 0.88 or above, narrow the range around the best scored values.
-n_trials is the product of the parameters being varied. Cap the product at {max_trials}.
+n_trials is the product of the coarse grids. Step 10 from 10 to 50 is 5. Use that product when it is below {max_trials}. {max_trials} is only the ceiling.
 The hypothesis must name the v2 metric and the direction.
 optimize must stay "avg_combined_final".
 
@@ -148,13 +147,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"   step 5 review rejected ({e}); keeping the draft", flush=True)
             else:
                 box = revised
+                box["n_trials"] = enough_trials(box["space"])
                 source = "steps+llm"
-                print("   step 5 review: accepted", flush=True)
+                print(
+                    f"   step 5 review: accepted  n_trials={box['n_trials']}",
+                    flush=True,
+                )
         elif not args.no_review:
             print("   step 5 review: skipped, no API key", flush=True)
         if report.get("mode") == "stop":
             box["run_experiment"] = False
 
+    box["n_trials"] = enough_trials(box["space"])
     box["suggested_by"] = f"agent+{source}"
     out_path = Path(args.out).resolve() if args.out else DEFAULT_OUT
     write_search_box(box, out_path)

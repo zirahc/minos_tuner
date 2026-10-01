@@ -119,19 +119,33 @@ def load_search_box(path: Path) -> Dict[str, Any]:
 
 
 def _param_trials(spec: Mapping[str, Any]) -> int:
-    """Trials for one parameter. A 30..100 range is 70. A 4-choice model is 4."""
+    """Coarse settings for one parameter. Step 10 from 10 to 50 is 5, not 40."""
     choices = list(spec.get("choices") or [])
-    if spec.get("type") == "categorical" or (spec.get("log") and choices):
+    if spec.get("type") == "categorical" or choices:
         return max(1, len(choices))
     try:
-        span = int(round(float(spec["high"]) - float(spec["low"])))
+        low = float(spec["low"])
+        high = float(spec["high"])
+        step = float(spec["step"])
     except (KeyError, TypeError, ValueError):
+        try:
+            return max(1, int(round(float(spec["high"]) - float(spec["low"]))) + 1)
+        except (KeyError, TypeError, ValueError):
+            return 1
+    if step <= 0 or high < low:
         return 1
-    return max(1, span)
+    count = 0
+    n = 0
+    while n < 10000:
+        if low + n * step > high + 1e-9:
+            break
+        count += 1
+        n += 1
+    return max(1, count)
 
 
 def enough_trials(space: Mapping[str, Any]) -> int:
-    """Product of each parameter's size. 4 PCR models times another range, capped at 500."""
+    """Product of each parameter's coarse grid. 500 is only the ceiling."""
     needed = 1
     for spec in space.values():
         if isinstance(spec, dict):
