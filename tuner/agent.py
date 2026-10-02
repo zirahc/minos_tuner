@@ -39,7 +39,13 @@ from tuner.search_box import (
     validate_search_box,
     write_search_box,
 )
-from tuner.spaces import SPACES, agent_reference, category_instruction, space_for
+from tuner.spaces import (
+    SPACES,
+    agent_reference,
+    category_instruction,
+    held_at_default,
+    space_for,
+)
 from tuner.steps import _keys_from_experiment, multistep_search_box
 from tuner.supabase_scores import fetch_config_scores
 from tuner.v2_score import V2_BRIEF
@@ -58,16 +64,17 @@ Rules:
 - Optimize avg_combined_final. The target is 0.9.
 - Study the history. Do not repeat a setting already scored there.
 - The same experiment with different parameter values is acceptable.
-- While the best score is below 0.88, make a large change: several catalog parameters, full coarse ranges, from more than one category if one category is stuck.
+- While the best score is below 0.88, change several parameters by a few coarse steps around the best scored value. Do not open the catalog edge. An empty or huge callset makes hap.py return no metrics, and that trial is a failure.
+- Do not search a choice parameter. emit_ref_confidence stays NONE, pcr_indel_model stays CONSERVATIVE, and recover_all_dangling_branches stays false.
 - A new experiment name starts with v2_ and lists its keys: v2_{{term}}__{{key}}__{{key}}. term is core, indel, snp, or fp.
 - Numeric values use the coarse step in the catalog. Do not ask for adjacent values such as 32, 34, 36 on a 30-100 range.
-- Categorical choices must be the full catalog list. Optuna cannot change that list later.
+- Choice parameters are not in the search. They are written as the catalog default.
 - Keys must already exist in the catalog. Do not invent GATK flags.
 - Each parameter note names the v2 metric it moves. The hypothesis must name that metric and the direction.
 - n_trials is the product of the coarse grid, not the raw high-low span. Step 10 from 10 to 50 is 5 trials.
 - When several parameters are searched together, multiply those grid sizes. 4 PCR models times another parameter's grid. Do not leave that search at 4.
 - {max_trials} is the maximum. Use the smaller product when the grid is smaller. Do not set {max_trials} unless the product is at least {max_trials}.
-- Failed / missing scores are not a GATK failure; ignore them for ranking.
+- A trial with no hap.py metrics failed because the callset could not be scored. Do not search that edge again. Ignore it when ranking scores.
 - Write a short hypothesis that a later review can confirm or reject.
 
 Return ONLY a JSON object with keys:
@@ -86,7 +93,7 @@ will move avg_combined_final toward 0.9.
 
 Study the history before you answer. Each history row's varied map is a setting that was already run. Do not propose that same setting again.
 The same experiment with different parameter values is acceptable. Prefer a new combination when the old values did not raise avg_combined_final.
-The target is 0.9. While the best score is below 0.88, make a large change: several catalog parameters at once, on their full coarse ranges, from more than one category when one category is stuck. Do not stay on a classic single-category screen, and do not shrink a full coarse range.
+The target is 0.9. While the best score is below 0.88, change several parameters at once, a few coarse steps from the best scored value. Do not widen a bound to the catalog edge: that is why hap.py returns no metrics and the trial fails. Do not add a choice parameter. emit_ref_confidence, pcr_indel_model, and recover_all_dangling_branches stay at their catalog defaults. Do not stay on a classic single-category screen.
 You may change search_category, the keys in space, the bounds, n_trials (1..{max_trials}), hypothesis, and constraints.
 A new experiment name starts with v2_ and lists its keys: v2_{{term}}__{{key}}__{{key}}. term is core, indel, snp, or fp.
 Keys must already exist in the catalog. Use each key's coarse step. Do not invent flags. Do not ask for a 1 or 2 unit change on a wide range.
@@ -158,6 +165,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         if report.get("mode") == "stop":
             box["run_experiment"] = False
 
+    box["space"] = {
+        key: spec for key, spec in box["space"].items() if not held_at_default(str(key))
+    }
+    if not box["space"]:
+        print("ERROR: search box has no numeric parameters left to vary", flush=True)
+        return 2
     box["n_trials"] = enough_trials(box["space"])
     box["suggested_by"] = f"agent+{source}"
     out_path = Path(args.out).resolve() if args.out else DEFAULT_OUT

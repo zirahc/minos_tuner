@@ -20,9 +20,8 @@ from tuner.spaces import (
 
 ALLOWED_OPTIMIZE = "avg_combined_final"
 MIN_TRIALS = 1
-# An integer span of 70 (30..100) may all be tried. The product of
-# several parameters may be larger, never more than 500.
-MAX_TRIALS = 500
+# The product of the coarse grid may be larger. Never more than 200.
+MAX_TRIALS = 200
 
 
 def specs_to_space_json(specs: Mapping[str, ParamSpec]) -> Dict[str, Any]:
@@ -145,7 +144,7 @@ def _param_trials(spec: Mapping[str, Any]) -> int:
 
 
 def enough_trials(space: Mapping[str, Any]) -> int:
-    """Product of each parameter's coarse grid. 500 is only the ceiling."""
+    """Product of each parameter's coarse grid. 200 is only the ceiling."""
     needed = 1
     for spec in space.values():
         if isinstance(spec, dict):
@@ -158,7 +157,13 @@ def optuna_distributions(space: Mapping[str, Any], optuna: Any) -> Dict[str, Any
     for key, spec in space.items():
         kind = spec.get("type")
         if kind == "int":
-            dists[key] = optuna.distributions.IntDistribution(int(spec["low"]), int(spec["high"]))
+            low = int(spec["low"])
+            high = int(spec["high"])
+            step = spec.get("step")
+            if step:
+                dists[key] = optuna.distributions.IntDistribution(low, high, step=int(step))
+            else:
+                dists[key] = optuna.distributions.IntDistribution(low, high)
         elif kind == "float" and spec.get("log") and spec.get("choices"):
             dists[key] = optuna.distributions.CategoricalDistribution(list(spec["choices"]))
         elif kind == "float":

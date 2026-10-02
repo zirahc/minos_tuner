@@ -316,6 +316,21 @@ def catalog_defaults() -> Dict[str, Any]:
     return params
 
 
+def held_at_default(key: str) -> bool:
+    """A choice parameter. It is written as the catalog default and not searched."""
+    spec = spec_of(str(key))
+    return spec is not None and spec.kind == "categorical"
+
+
+def apply_held_defaults(params: Mapping[str, Any]) -> Dict[str, Any]:
+    """Force emit_ref_confidence, pcr_indel_model, and recover_all_dangling_branches."""
+    out = dict(params)
+    for key, value in catalog_defaults().items():
+        if held_at_default(key):
+            out[key] = value
+    return out
+
+
 def full_params_from_row(row: Mapping[str, Any]) -> Dict[str, Any]:
     """Every catalog parameter on the config that was actually scored.
 

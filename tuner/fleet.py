@@ -58,11 +58,13 @@ from tuner.jobs import (
 )
 from tuner.search_box import MAX_TRIALS, load_search_box, optuna_distributions
 from tuner.spaces import (
+    apply_held_defaults,
     best_base_updates,
     categories_touched,
     category_of,
     coerce_param,
     default_study_name,
+    held_at_default,
     is_agent_experiment,
     spec_of,
 )
@@ -330,6 +332,12 @@ def _build_stack(args: argparse.Namespace) -> bool:
             flush=True,
         )
         return False
+    box["space"] = {
+        key: spec for key, spec in box["space"].items() if not held_at_default(str(key))
+    }
+    if not box["space"]:
+        print("   search box has no numeric parameters left to vary", flush=True)
+        return False
     category = box["search_category"]
     study_name = args.study or default_study_name(category)
     box["study_name"] = study_name
@@ -397,18 +405,19 @@ def _build_stack(args: argparse.Namespace) -> bool:
     budget = max(1, min(MAX_TRIALS, int(box.get("n_trials") or 1)))
     distinct = _distinct_settings(box["space"])
     fresh: List[Dict[str, Any]] = []
-    if distinct is not None and distinct < budget:
+    if distinct is not None and distinct <= 100000:
         fresh = [
             params for params in _enumerate_settings(box["space"])
             if param_signature(params) not in known
         ]
-        target = min(budget, len(fresh))
+        chosen = _spread_settings(fresh, budget)
+        target = len(chosen)
         print(
-            f"   {category} has {distinct} setting(s), {len(fresh)} not in history; "
-            f"stack uses {target}",
+            f"   {category} has {distinct} coarse setting(s), "
+            f"{len(fresh)} not in history; stack uses {target}",
             flush=True,
         )
-        for params in fresh[:target]:
+        for params in chosen:
             try:
                 study.enqueue_trial(params)
             except Exception as e:  # noqa: BLE001
@@ -471,8 +480,9 @@ def _build_stack(args: argparse.Namespace) -> bool:
                 print(f"   skip trial={trial.number} already tried {params}", flush=True)
             continue
         known[signature] = (params, None)
-        updates = dict(base)
+        updates = apply_held_defaults(dict(base))
         updates.update(params)
+        updates = apply_held_defaults(updates)
         experiment = f"optuna-{category}-t{trial.number}"
         print(
             f"   stack [{placed + 1}/{target}] trial={trial.number} "
@@ -768,6 +778,16 @@ def _distinct_settings(space: Dict[str, Any]) -> Optional[int]:
         if total > 100000:
             return None
     return max(1, total)
+
+
+def _spread_settings(settings: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    """Take `limit` settings spread across the grid, not the first corner."""
+    if limit <= 0 or not settings:
+        return []
+    if len(settings) <= limit:
+        return list(settings)
+    stride = len(settings) / limit
+    return [settings[int(i * stride)] for i in range(limit)]
 
 
 def _enumerate_settings(space: Dict[str, Any]) -> List[Dict[str, Any]]:

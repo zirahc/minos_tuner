@@ -18,6 +18,7 @@ from tuner.spaces import (
     category_of,
     coerce_param,
     full_pass_category,
+    held_at_default,
     is_agent_experiment,
     space_for,
     spec_of,
@@ -54,8 +55,11 @@ BOTTLENECK_PLAN: Dict[str, Tuple[str, ...]] = {
     ),
 }
 
-# Below this, search the full coarse range. At this score, tighten around the best.
+# Below this, search a wide coarse band around the best scored value.
+# The catalog edges are not used: an empty or huge callset makes hap.py
+# return no metrics, and the trial is stored as failed.
 NANO_AT = 0.88
+LEAP_STEPS = 2
 # A category that does not beat the current best by more than this
 # is not given more trials.
 MIN_GAIN = 0.01
@@ -90,7 +94,10 @@ def multistep_search_box(
     scored = _rows_for_category(history, category) if mode != "experiment" else []
     shrink = phase == "nano" and mode == "refine" and len(scored) >= SHRINK_MIN_TRIALS
     if mode != "experiment":
-        space = specs_to_space_json(space_for(category)) if phase == "leap" else _space_json(category, scored if shrink else [])
+        if phase == "leap":
+            space = _leap_space(history, list(space_for(category)))
+        else:
+            space = _space_json(category, scored if shrink else [])
     if shrink and not _searchable(space):
         category, reason, mode = _next_searchable(report, category)
         scored = _rows_for_category(history, category)
@@ -339,9 +346,9 @@ def _leap_experiment(
             continue
         reason = _experiment_reason(loss, losses.get(loss), picked)
         reason += (
-            " Full coarse range across the parameters that can still move the score."
-            " The target is 0.9, so this is a large change, not a one-category screen."
-            " A setting already in history is not repeated."
+            " Wide coarse steps around the best scored value, not the catalog edge."
+            " The catalog edge makes hap.py return no metrics, so the trial fails."
+            " The target is 0.9. A setting already in history is not repeated."
             " The same experiment with different values is allowed."
         )
         if fallback is None:
@@ -371,7 +378,7 @@ def _leap_candidates(
     for loss in terms:
         for name in _loss_categories(loss):
             for key, spec in space_for(name).items():
-                if key in seen:
+                if key in seen or held_at_default(key):
                     continue
                 seen.add(key)
                 ordered.append((0.0, key, spec, {}))
@@ -399,15 +406,60 @@ def _phase(report: Mapping[str, Any]) -> str:
 def _term_space(
     history: Sequence[Mapping[str, Any]], keys: Sequence[str], phase: str
 ) -> Dict[str, Any]:
-    """Leap uses the whole coarse catalog. Nano stays next to the best value."""
+    """Leap is a wide band around the best value. Nano stays next to it."""
     if phase == "nano":
         return _directed_space(history, keys)
-    specs: Dict[str, ParamSpec] = {}
+    return _leap_space(history, keys)
+
+
+def _leap_space(
+    history: Sequence[Mapping[str, Any]], keys: Sequence[str]
+) -> Dict[str, Any]:
+    """A few coarse steps each side of the best scored value.
+
+    The full catalog is what makes hap.py fail: the low end emits a huge
+    callset and times out, and the high end emits nothing usable.
+    """
+    out: Dict[str, Any] = {}
     for key in keys:
+        if held_at_default(key):
+            continue
         spec = spec_of(key)
         if spec is not None:
-            specs[key] = spec
-    return specs_to_space_json(specs)
+            out[key] = _leap_item(history, key, spec)
+    return out
+
+
+def _leap_item(
+    history: Sequence[Mapping[str, Any]], key: str, spec: ParamSpec
+) -> Dict[str, Any]:
+    full = specs_to_space_json({key: spec})[key]
+    if spec.kind == "categorical" or spec.log:
+        return full
+    step = coarse_step(spec)
+    if step is None or spec.low is None or spec.high is None:
+        return full
+    anchor = _best_setting(history, key, spec)
+    if anchor is None:
+        try:
+            anchor = float(coerce_param(spec, spec.default))
+        except (TypeError, ValueError):
+            return full
+    low, high = _snap_span(
+        anchor - LEAP_STEPS * float(step),
+        anchor + LEAP_STEPS * float(step),
+        float(step),
+        float(spec.low),
+        float(spec.high),
+    )
+    item = dict(full)
+    if spec.kind == "int":
+        item["low"] = int(round(low))
+        item["high"] = int(round(high))
+    else:
+        item["low"] = _round_float(low)
+        item["high"] = _round_float(high)
+    return item
 
 
 def _available_terms(losses: Mapping[str, Any]) -> List[str]:
@@ -460,6 +512,8 @@ def _ranked_movers(
     ranked = []
     for specs in SPACES.values():
         for key, spec in specs.items():
+            if held_at_default(key):
+                continue
             bins = _param_bins(history, key, spec, cache)
             means = list(_supported_means(bins).values())
             if len(means) < 2:
