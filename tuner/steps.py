@@ -200,7 +200,11 @@ def choose_category(report: Mapping[str, Any]) -> Tuple[str, str, str]:
     category in the visit order is opened. Old rows that changed only a
     few keys do not count as that pass.
     """
-    order = list(report.get("visit_order") or _visit_order(str(report.get("bottleneck") or "broad")))
+    order = [
+        name
+        for name in (report.get("visit_order") or _visit_order(str(report.get("bottleneck") or "broad")))
+        if _numeric_category(name)
+    ] or ["quality_filters"]
     passes = report.get("full_passes") if isinstance(report.get("full_passes"), dict) else {}
     if report.get("bottleneck") == "no_history" or not any(int(passes.get(name) or 0) for name in order):
         first = order[0]
@@ -208,14 +212,6 @@ def choose_category(report: Mapping[str, Any]) -> Tuple[str, str, str]:
             first,
             f"full-config pass starts at {first}; the other parameters stay at the best config",
             "explore",
-        )
-    best = report.get("best_avg_combined_final")
-    if isinstance(best, float) and best < NANO_AT:
-        return (
-            order[0],
-            "best score is below 0.88; build a large experiment from history "
-            "instead of another category screen. The target is 0.9",
-            "experiment",
         )
     needs = report.get("needs_screen") if isinstance(report.get("needs_screen"), dict) else {}
     for name in order:
@@ -226,12 +222,19 @@ def choose_category(report: Mapping[str, Any]) -> Tuple[str, str, str]:
                 f"keep the best config and vary {name} ({done} full-config scores so far)",
                 "explore",
             )
+    name = order[0] if order else "quality_filters"
     return (
-        order[0],
-        "category screens are done; the next experiment takes the next v2 term "
-        "that still has points left",
-        "experiment",
+        name,
+        f"category screens are done; vary {name} again on the best config",
+        "explore",
     )
+
+
+def _numeric_category(name: str) -> bool:
+    """A catalog category that still has a numeric parameter to search."""
+    if name not in SPACES:
+        return False
+    return any(not held_at_default(key) for key in space_for(name))
 
 
 def _visit_order(bottleneck: str) -> List[str]:

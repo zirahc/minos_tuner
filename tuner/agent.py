@@ -65,10 +65,11 @@ Rules:
 - Study the history. Do not repeat a setting already scored there.
 - The same experiment with different parameter values is acceptable.
 - While the best score is below 0.88, change several parameters by a few coarse steps around the best scored value. Do not open the catalog edge. An empty or huge callset makes hap.py return no metrics, and that trial is a failure.
-- Do not search a choice parameter. emit_ref_confidence stays NONE, pcr_indel_model stays CONSERVATIVE, and recover_all_dangling_branches stays false.
-- A new experiment name starts with v2_ and lists its keys: v2_{{term}}__{{key}}__{{key}}. term is core, indel, snp, or fp.
+- Do not search a choice parameter. emit_ref_confidence, pcr_indel_model, and recover_all_dangling_branches stay at the values on the highest-scoring config.
+- search_category must be the catalog category already chosen. Do not invent a name and do not change it.
+- space keys must belong to that category.
 - Numeric values use the coarse step in the catalog. Do not ask for adjacent values such as 32, 34, 36 on a 30-100 range.
-- Choice parameters are not in the search. They are written as the catalog default.
+- Choice parameters are not in the search. They stay on the highest-scoring config.
 - Keys must already exist in the catalog. Do not invent GATK flags.
 - Each parameter note names the v2 metric it moves. The hypothesis must name that metric and the direction.
 - n_trials is the product of the coarse grid, not the raw high-low span. Step 10 from 10 to 50 is 5 trials.
@@ -88,14 +89,12 @@ REVIEW_PROMPT = """You revise ONE Optuna search box for Minos GATK practice tuni
 {v2}
 
 You are given the scored history, a diagnosis, and a draft box.
-The draft is a starting point. Replace it when history shows a larger experiment
-will move avg_combined_final toward 0.9.
+The draft already chose the catalog category. Do not change search_category.
 
 Study the history before you answer. Each history row's varied map is a setting that was already run. Do not propose that same setting again.
-The same experiment with different parameter values is acceptable. Prefer a new combination when the old values did not raise avg_combined_final.
-The target is 0.9. While the best score is below 0.88, change several parameters at once, a few coarse steps from the best scored value. Do not widen a bound to the catalog edge: that is why hap.py returns no metrics and the trial fails. Do not add a choice parameter. emit_ref_confidence, pcr_indel_model, and recover_all_dangling_branches stay at their catalog defaults. Do not stay on a classic single-category screen.
-You may change search_category, the keys in space, the bounds, n_trials (1..{max_trials}), hypothesis, and constraints.
-A new experiment name starts with v2_ and lists its keys: v2_{{term}}__{{key}}__{{key}}. term is core, indel, snp, or fp.
+The same category with different parameter values is acceptable.
+The target is 0.9. While the best score is below 0.88, keep the wide coarse band around the best scored value. Do not widen a bound to the catalog edge: that is why hap.py returns no metrics and the trial fails. Do not add a choice parameter. Those stay on the highest-scoring config.
+You may change bounds, n_trials (1..{max_trials}), hypothesis, or constraints. Space keys must stay inside the draft category.
 Keys must already exist in the catalog. Use each key's coarse step. Do not invent flags. Do not ask for a 1 or 2 unit change on a wide range.
 At 0.88 or above, narrow the range around the best scored values.
 n_trials is the product of the coarse grids. Step 10 from 10 to 50 is 5. Use that product when it is below {max_trials}. {max_trials} is only the ceiling.
@@ -117,6 +116,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     if rows is None:
         return 2
     rows = list(reversed(rows))
+    best_rows = fetch_config_scores(
+        category=None,
+        scored_only=True,
+        limit=1,
+        order="avg_combined_final.desc",
+    )
+    if best_rows:
+        best = best_rows[0]
+        best_id = str(best.get("config_id") or "")
+        if best_id and all(str(row.get("config_id") or "") != best_id for row in rows):
+            rows.append(best)
+        score = best.get("avg_combined_final")
+        print(
+            f"   highest avg_combined_final={score} "
+            f"experiment={best.get('experiment')} config_id={best_id}",
+            flush=True,
+        )
 
     history = _compact_history(rows)
     print(f"   history rows for agent: {len(rows)} (newest {len(history)} kept for the log)", flush=True)
@@ -147,13 +163,31 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
         _print_report(report)
         source = "steps"
+        kept = dict(box)
+        draft_category = str(box["search_category"])
         if _has_llm_key() and not args.no_review:
             try:
                 revised = validate_search_box(_llm_review(report, box, history))
             except (ValueError, RuntimeError) as e:
                 print(f"   step 5 review rejected ({e}); keeping the draft", flush=True)
             else:
-                box = revised
+                allowed = set(space_for(draft_category))
+                space = {
+                    key: spec
+                    for key, spec in revised["space"].items()
+                    if key in allowed and not held_at_default(str(key))
+                }
+                if not space:
+                    print(
+                        "   step 5 review left no parameters in "
+                        f"{draft_category}; keeping the draft",
+                        flush=True,
+                    )
+                    box = kept
+                else:
+                    box = revised
+                    box["search_category"] = draft_category
+                    box["space"] = space
                 box["n_trials"] = enough_trials(box["space"])
                 source = "steps+llm"
                 print(
@@ -334,9 +368,8 @@ def _llm_review(
             "history": _setting_brief(history),
             "draft": draft,
             "instruction": (
-                "Study the history. Propose a large experiment that does not "
-                "repeat a varied setting already scored. The same experiment "
-                "with different values is allowed. Return JSON only."
+                "Keep the draft search_category. Adjust bounds inside that "
+                "catalog category only. Do not invent a category. Return JSON only."
             ),
         },
         default=str,

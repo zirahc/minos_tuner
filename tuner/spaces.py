@@ -317,25 +317,16 @@ def catalog_defaults() -> Dict[str, Any]:
 
 
 def held_at_default(key: str) -> bool:
-    """A choice parameter. It is written as the catalog default and not searched."""
+    """A choice parameter. It is not searched; it stays on the best config."""
     spec = spec_of(str(key))
     return spec is not None and spec.kind == "categorical"
 
 
-def apply_held_defaults(params: Mapping[str, Any]) -> Dict[str, Any]:
-    """Force emit_ref_confidence, pcr_indel_model, and recover_all_dangling_branches."""
-    out = dict(params)
-    for key, value in catalog_defaults().items():
-        if held_at_default(key):
-            out[key] = value
-    return out
-
-
 def full_params_from_row(row: Mapping[str, Any]) -> Dict[str, Any]:
-    """Every catalog parameter on the config that was actually scored.
+    """Every catalog parameter from the scored config file.
 
-    gatk_updates wins, then gatk_config, then the catalog default.
-    Keys outside the catalog are copied from gatk_config so the file matches that run.
+    gatk_config is the file that was scored. gatk_updates fills a key the
+    file does not have. Anything still missing stays at the catalog default.
     """
     updates = row.get("gatk_updates") if isinstance(row.get("gatk_updates"), dict) else {}
     config = row.get("gatk_config") if isinstance(row.get("gatk_config"), dict) else {}
@@ -345,17 +336,36 @@ def full_params_from_row(row: Mapping[str, Any]) -> Dict[str, Any]:
             params[key] = value
     for specs in SPACES.values():
         for key, spec in specs.items():
-            if key in updates:
-                raw = updates[key]
-            elif key in config:
+            if key in config:
                 raw = config[key]
+            elif key in updates:
+                raw = updates[key]
             else:
                 continue
             try:
-                params[key] = coerce_param(spec, raw)
+                params[key] = _stored_value(spec, raw)
             except (TypeError, ValueError):
                 params[key] = spec.default
     return params
+
+
+def _stored_value(spec: ParamSpec, raw: Any) -> Any:
+    """Keep the scored config value. Do not move it onto the search step."""
+    if spec.kind == "categorical":
+        return coerce_param(spec, raw)
+    if spec.kind == "int":
+        value = int(round(float(raw)))
+        if spec.low is not None:
+            value = max(int(spec.low), value)
+        if spec.high is not None:
+            value = min(int(spec.high), value)
+        return value
+    value = float(raw)
+    if spec.low is not None:
+        value = max(float(spec.low), value)
+    if spec.high is not None:
+        value = min(float(spec.high), value)
+    return value
 
 
 def best_base_updates(

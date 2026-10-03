@@ -58,7 +58,6 @@ from tuner.jobs import (
 )
 from tuner.search_box import MAX_TRIALS, load_search_box, optuna_distributions
 from tuner.spaces import (
-    apply_held_defaults,
     best_base_updates,
     categories_touched,
     category_of,
@@ -445,9 +444,11 @@ def _build_stack(args: argparse.Namespace) -> bool:
         print(f"   base config is the catalog default ({len(base)} parameters)", flush=True)
     else:
         print(
-            f"   base config {best_row.get('experiment')} "
-            f"avg_combined_final={float(best_row.get('avg_combined_final')):.4f} "
-            f"({len(base)} parameters); this stack varies {category}",
+            f"   default config is the highest avg_combined_final: "
+            f"{best_row.get('experiment')} "
+            f"{float(best_row.get('avg_combined_final')):.4f} "
+            f"({len(base)} parameters). This stack varies {category}; "
+            "every other parameter stays on that config.",
             flush=True,
         )
 
@@ -480,9 +481,8 @@ def _build_stack(args: argparse.Namespace) -> bool:
                 print(f"   skip trial={trial.number} already tried {params}", flush=True)
             continue
         known[signature] = (params, None)
-        updates = apply_held_defaults(dict(base))
+        updates = dict(base)
         updates.update(params)
-        updates = apply_held_defaults(updates)
         experiment = f"optuna-{category}-t{trial.number}"
         print(
             f"   stack [{placed + 1}/{target}] trial={trial.number} "
