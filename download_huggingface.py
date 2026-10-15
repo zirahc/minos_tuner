@@ -120,11 +120,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"ERROR: dataset repo must look like owner/name, got {repo!r}", flush=True)
         return 2
     revision = (args.revision or DEFAULT_REVISION).strip() or DEFAULT_REVISION
+    try:
+        repo_kind = _repo_kind(repo)
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as e:
+        print(f"ERROR: {e}", flush=True)
+        return 2
 
     print("=" * 72, flush=True)
     print("  DOWNLOAD HUGGING FACE ROUNDS", flush=True)
     print("=" * 72, flush=True)
-    print(f"  Dataset:   {repo} @ {revision}", flush=True)
+    print(f"  Dataset:   {repo} ({repo_kind}) @ {revision}", flush=True)
     if args.folder:
         print(f"  Folder:    {folders[0]}", flush=True)
     else:
@@ -141,7 +146,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"  [{index}/{len(folders)}] {folder}", flush=True)
         print(f"{'#' * 72}", flush=True)
         count, folder_chroms, error = _download_folder(
-            repo, revision, folder, practice_dir, force=args.force,
+            repo, revision, repo_kind, folder, practice_dir, force=args.force,
         )
         saved += count
         if error:
@@ -248,13 +253,14 @@ def _load_rounds(path: Path) -> List[str]:
 def _download_folder(
     repo: str,
     revision: str,
+    repo_kind: str,
     folder: str,
     practice_dir: Path,
     force: bool,
 ) -> tuple:
     """Download one round. Returns (file_count, chromosomes, error)."""
     try:
-        files = _list_files(repo, revision, folder)
+        files = _list_files(repo, revision, repo_kind, folder)
     except (urllib.error.URLError, OSError, TimeoutError, ValueError) as e:
         return 0, [], f"could not list {folder}: {e}"
     if not files:
@@ -274,7 +280,7 @@ def _download_folder(
             print(f"      already downloaded — reusing {dest.name}", flush=True)
             saved += 1
             continue
-        url = _resolve_url(repo, revision, rel)
+        url = _resolve_url(repo, revision, repo_kind, rel)
         if not _download_file(url, dest, expected_size=expected, headers=_hf_headers()):
             return saved, [], f"failed to download {rel}"
         saved += 1
@@ -310,12 +316,34 @@ def _hf_headers() -> Dict[str, str]:
     return headers
 
 
-def _list_files(repo: str, revision: str, folder: str) -> List[Dict[str, Any]]:
-    quoted_repo = "/".join(urllib.parse.quote(part) for part in repo.split("/"))
+def _quote_repo(repo: str) -> str:
+    return "/".join(urllib.parse.quote(part) for part in repo.split("/"))
+
+
+def _repo_kind(repo: str) -> str:
+    """A Hugging Face id can be a dataset or a model. eliteminer/minos_ch19 is a model."""
+    headers = {**_hf_headers(), "Accept": "application/json"}
+    quoted = _quote_repo(repo)
+    for kind, api in (("dataset", "datasets"), ("model", "models")):
+        url = f"https://huggingface.co/api/{api}/{quoted}"
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                if 200 <= resp.status < 300:
+                    return kind
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                continue
+            raise ValueError(f"could not read {repo}: HTTP {e.code}") from e
+    raise ValueError(f"{repo} was not found as a Hugging Face dataset or model")
+
+
+def _list_files(repo: str, revision: str, repo_kind: str, folder: str) -> List[Dict[str, Any]]:
+    api = "datasets" if repo_kind == "dataset" else "models"
     quoted_rev = urllib.parse.quote(revision, safe="")
     quoted_folder = urllib.parse.quote(folder, safe="/")
     page = (
-        f"https://huggingface.co/api/datasets/{quoted_repo}/tree/"
+        f"https://huggingface.co/api/{api}/{_quote_repo(repo)}/tree/"
         f"{quoted_rev}/{quoted_folder}?recursive=true"
     )
     files: List[Dict[str, Any]] = []
@@ -365,11 +393,13 @@ def _remote_size(item: Dict[str, Any]) -> int:
         return 0
 
 
-def _resolve_url(repo: str, revision: str, path: str) -> str:
-    quoted_repo = "/".join(urllib.parse.quote(part) for part in repo.split("/"))
+def _resolve_url(repo: str, revision: str, repo_kind: str, path: str) -> str:
     quoted_rev = urllib.parse.quote(revision, safe="")
     quoted_path = urllib.parse.quote(path, safe="/")
-    return f"https://huggingface.co/datasets/{quoted_repo}/resolve/{quoted_rev}/{quoted_path}"
+    quoted_repo = _quote_repo(repo)
+    if repo_kind == "dataset":
+        return f"https://huggingface.co/datasets/{quoted_repo}/resolve/{quoted_rev}/{quoted_path}"
+    return f"https://huggingface.co/{quoted_repo}/resolve/{quoted_rev}/{quoted_path}"
 
 
 def _dest_for(practice_dir: Path, repo_path: str, folder: str) -> Path:
