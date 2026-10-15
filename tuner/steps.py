@@ -74,10 +74,32 @@ MIN_BIN_ROWS = 3
 
 def multistep_search_box(
     history: Sequence[Mapping[str, Any]],
+    skip: Sequence[str] = (),
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Return (search box, report). The box still needs validate_search_box."""
     report = diagnose(history)
-    category, reason, mode = choose_category(report)
+    category, reason, mode = choose_category(report, skip)
+    if mode == "stop":
+        held = category if category in SPACES else "quality_filters"
+        space = specs_to_space_json(space_for(held))
+        hypothesis = _hypothesis(report, held, reason, "stop")
+        report.update({
+            "choice": held,
+            "reason": reason,
+            "mode": "stop",
+            "bounds": "stop",
+            "n_trials": 1,
+            "hypothesis": hypothesis,
+        })
+        return {
+            "search_category": held,
+            "hypothesis": hypothesis,
+            "space": space,
+            "constraints": {},
+            "n_trials": 1,
+            "optimize": "avg_combined_final",
+            "run_experiment": False,
+        }, report
     if mode == "experiment":
         built = _v2_experiment(history, report)
         if built is None:
@@ -192,19 +214,30 @@ def diagnose(history: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def choose_category(report: Mapping[str, Any]) -> Tuple[str, str, str]:
+def choose_category(
+    report: Mapping[str, Any],
+    skip: Sequence[str] = (),
+) -> Tuple[str, str, str]:
     """One category per stack, on top of the best full config.
 
     A stack varies one category. The other parameters stay at the best
     scored values. After that category has a full-config stack, the next
     category in the visit order is opened. Old rows that changed only a
-    few keys do not count as that pass.
+    few keys do not count as that pass. Names in skip are already scored
+    on the current base, so the next name is used until that base changes.
     """
+    blocked = {str(name) for name in skip}
     order = [
         name
         for name in (report.get("visit_order") or _visit_order(str(report.get("bottleneck") or "broad")))
-        if _numeric_category(name)
-    ] or ["quality_filters"]
+        if _numeric_category(name) and name not in blocked
+    ]
+    if not order:
+        return (
+            "quality_filters",
+            "every numeric category is already scored on the current base",
+            "stop",
+        )
     passes = report.get("full_passes") if isinstance(report.get("full_passes"), dict) else {}
     if report.get("bottleneck") == "no_history" or not any(int(passes.get(name) or 0) for name in order):
         first = order[0]
@@ -222,7 +255,7 @@ def choose_category(report: Mapping[str, Any]) -> Tuple[str, str, str]:
                 f"keep the best config and vary {name} ({done} full-config scores so far)",
                 "explore",
             )
-    name = order[0] if order else "quality_filters"
+    name = order[0]
     return (
         name,
         f"category screens are done; vary {name} again on the best config",

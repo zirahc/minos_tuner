@@ -156,7 +156,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         source = "llm"
     else:
         try:
-            draft, report = multistep_search_box(rows)
+            draft, report = multistep_search_box(rows, skip=_skip_names(args))
             box = validate_search_box(draft)
         except ValueError as e:
             print(f"ERROR: multi-step box invalid: {e}", flush=True)
@@ -533,11 +533,20 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         help="Include configs with no scored combined_final in the history payload.",
     )
     p.add_argument(
+        "--skip",
+        default="",
+        help="Comma-separated categories already scored on the current base.",
+    )
+    p.add_argument(
         "--out",
         default=str(DEFAULT_OUT),
         help=f"Write JSON here (default {DEFAULT_OUT})",
     )
     return p.parse_args(argv)
+
+
+def _skip_names(args: argparse.Namespace) -> List[str]:
+    return [part.strip() for part in str(args.skip or "").split(",") if part.strip()]
 
 
 if __name__ == "__main__":

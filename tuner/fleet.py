@@ -92,6 +92,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("   the agent runs again after the stack finishes", flush=True)
     print("   GATK VPS: set WORKER_ID and run python main.py", flush=True)
     print("   stop with Ctrl+C", flush=True)
+    args.scored_categories = []
     while True:
         try:
             rc = run_once(args)
@@ -102,8 +103,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"   ERROR: {type(e).__name__}: {e} — retrying in 60s", flush=True)
             time.sleep(60)
             continue
+        if rc == 0:
+            args.scored_categories = []
         if rc == 2:
             print("   setup error — retrying in 60s", flush=True)
+            time.sleep(60)
+            continue
+        if rc == 3:
+            print(
+                "   no unscored settings on the current base — retrying in 60s",
+                flush=True,
+            )
             time.sleep(60)
             continue
         if rc != 0:
@@ -116,7 +126,10 @@ def run_once(args: argparse.Namespace) -> int:
     if queued is None or inflight is None:
         return 2
     if not queued and not inflight:
-        if not _build_stack(args):
+        built = _build_stack(args)
+        if built is None:
+            return 3
+        if not built:
             return 2
         queued = list_queued()
         inflight = list_open_jobs()
@@ -212,7 +225,7 @@ def run_once(args: argparse.Namespace) -> int:
         queued = [row for row in refreshed if str(row.get("id") or "") not in assigned_ids]
 
 
-def _build_stack(args: argparse.Namespace) -> bool:
+def _build_stack(args: argparse.Namespace) -> Optional[bool]:
     try:
         listed = load_experiments(Path(args.experiments))
     except ValueError as e:
@@ -240,7 +253,30 @@ def _build_stack(args: argparse.Namespace) -> bool:
             "   file experiments are already scored on this base; asking the agent",
             flush=True,
         )
-    return _enqueue_box(args, None) is True
+    skipped = [str(name) for name in (getattr(args, "scored_categories", None) or [])]
+    while len(skipped) < 16:
+        outcome = _enqueue_box(args, None, skipped)
+        if outcome is True:
+            return True
+        if outcome is False:
+            return False
+        if not isinstance(outcome, str) or outcome in skipped:
+            print(
+                "   every category is already scored on the current base",
+                flush=True,
+            )
+            args.scored_categories = skipped
+            return None
+        skipped.append(outcome)
+        args.scored_categories = list(skipped)
+        print(
+            f"   {outcome} is scored on this base; choosing the next category. "
+            "It runs again after that base changes.",
+            flush=True,
+        )
+    print("   every category is already scored on the current base", flush=True)
+    args.scored_categories = skipped
+    return None
 
 
 def _enqueue_fixed(args: argparse.Namespace, item: Dict[str, Any]) -> Optional[bool]:
@@ -310,10 +346,17 @@ def _config_seen(rows: List[Dict[str, Any]], updates: Dict[str, Any]) -> bool:
 def _enqueue_box(
     args: argparse.Namespace,
     preset: Optional[Dict[str, Any]],
-) -> Optional[bool]:
-    """Queue one search box. None means that box is already scored on this base."""
+    skip: Optional[List[str]] = None,
+) -> Any:
+    """Queue one search box.
+
+    True when trials were placed. False on a setup error. A category name
+    means that grid is already scored on the current base.
+    """
     if preset is None:
-        rc = agent_main([])
+        held = [name for name in (skip or []) if name]
+        argv = ["--no-review", "--skip", ",".join(held)] if held else []
+        rc = agent_main(argv)
         if rc != 0:
             print("   agent did not write a search box", flush=True)
             return False
@@ -334,11 +377,10 @@ def _enqueue_box(
 
     if box.get("run_experiment") is False:
         print(
-            f"   no category beat the best by more than {MIN_GAIN:.2f}; "
-            "not starting another flat experiment",
+            f"   {box.get('hypothesis') or 'not starting another experiment'}",
             flush=True,
         )
-        return False
+        return None
     box["space"] = {
         key: spec for key, spec in box["space"].items() if not held_at_default(str(key))
     }
@@ -447,7 +489,7 @@ def _enqueue_box(
             "it runs again after another category changes that base",
             flush=True,
         )
-        return None
+        return str(category)
 
     if best_row is None:
         print(f"   base config is the catalog default ({len(base)} parameters)", flush=True)
@@ -464,6 +506,7 @@ def _enqueue_box(
     batch_id = str(uuid.uuid4())
     placed = 0
     attempts = 0
+    insert_failed = False
     while placed < target and attempts < target * 4:
         attempts += 1
         try:
@@ -514,10 +557,13 @@ def _enqueue_box(
                 flush=True,
             )
             _tell_state(study, trial.number, TrialState.FAIL)
+            insert_failed = True
             continue
         placed += 1
     if placed == 0:
-        return False
+        if insert_failed:
+            return False
+        return str(category)
     print(f"   placed {placed} trial(s) on the stack", flush=True)
     return True
 
