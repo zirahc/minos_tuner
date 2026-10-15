@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # GATK VPS setup. Clone minos_tuner first, then from that folder:
-#   bash start.sh 1 18
-# First argument is this machine's WORKER_ID. Second is the practice chromosome.
+#   bash start.sh 1
+# The argument is this machine's WORKER_ID.
+# Rounds listed in hf_test_rounds.txt are downloaded with download_huggingface.py.
 # minos_subnet is cloned next to minos_tuner. No other file is edited.
 
 set -euo pipefail
 
-if [[ $# -ne 2 || -z "${1:-}" || -z "${2:-}" ]]; then
-  echo "Usage: bash start.sh WORKER_ID CHR_TYPE"
-  echo "Example: bash start.sh 1 18"
+if [[ $# -ne 1 || -z "${1:-}" ]]; then
+  echo "Usage: bash start.sh WORKER_ID"
+  echo "Example: bash start.sh 1"
   exit 1
 fi
 
 WORKER_ID="$1"
-CHR_TYPE="$2"
 TUNER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PARENT_DIR="$(cd "$TUNER_DIR/.." && pwd)"
 SUBNET_DIR="$PARENT_DIR/minos_subnet"
@@ -21,7 +21,6 @@ SUBNET_DIR="$PARENT_DIR/minos_subnet"
 echo "tuner:  $TUNER_DIR"
 echo "subnet: $SUBNET_DIR"
 echo "worker: $WORKER_ID"
-echo "chr:    $CHR_TYPE"
 
 if [[ ! -d "$SUBNET_DIR/.git" ]]; then
   git clone https://github.com/minos-protocol/minos_subnet.git "$SUBNET_DIR"
@@ -182,5 +181,5 @@ fi
 source "$SUBNET_DIR/.venv/bin/activate"
 cd "$TUNER_DIR"
 pip install -r requirements.txt
-python download_practice_samples.py --type "$CHR_TYPE"
+python download_huggingface.py
 exec python main.py
