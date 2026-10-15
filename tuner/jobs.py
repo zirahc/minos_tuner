@@ -65,7 +65,8 @@ def insert_pending_config(
 def experiment_name_exists(name: str) -> Optional[bool]:
     """True when experiments.json name already has a gatk_configs row.
 
-    A screen is stored as name-t0, name-t1, and so on. None means the read failed.
+    The experiment column is that name. Older rows stored as name-t0 still count.
+    None means the read failed.
     """
     label = str(name or "").strip()
     if not label:

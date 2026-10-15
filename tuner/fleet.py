@@ -601,8 +601,8 @@ def _enqueue_box(
         known[signature] = (params, None)
         updates = dict(base)
         updates.update(params)
-        label = str(box.get("manual_name") or f"optuna-{category}")
-        experiment = f"{label}-t{trial.number}"
+        manual = str(box.get("manual_name") or "").strip()
+        experiment = manual or f"optuna-{category}-t{trial.number}"
         print(
             f"   stack [{placed + 1}/{target}] trial={trial.number} "
             f"vary={params}  full_keys={len(updates)}",
