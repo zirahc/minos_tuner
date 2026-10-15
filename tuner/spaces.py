@@ -185,7 +185,7 @@ SPACES: Dict[str, Dict[str, ParamSpec]] = {
             "float", 0.002, low=0.001, high=0.05, log=True,
             note=(
                 "Minimum probability for a site to be assembled. Lower raises core F1 "
-                "by examining more sites. Higher leaves those sites uncalled."
+                "by examining more   sites. Higher leaves those sites uncalled."
             ),
         ),
         "min_assembly_region_size": ParamSpec(

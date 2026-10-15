@@ -2,7 +2,8 @@
 """GATK VPS loop, or a one-shot update file.
 
 24/7 (default): wait until the tuner assigns this WORKER_ID a setting,
-score that setting on 15 practice rounds, POST the rows, then wait again.
+score that setting on every practice round in the folder, POST the rows,
+then wait again.
 
   set WORKER_ID=1
   python main.py
@@ -159,7 +160,7 @@ def main() -> int:
 
 
 def run_wait_loop(args: argparse.Namespace) -> int:
-    """Claim this VPS's next tuner job, score FLEET rounds, POST, repeat."""
+    """Claim this VPS's next tuner job, score every practice round, POST, repeat."""
     worker_id = str(args.worker or "").strip()
     if not worker_id:
         print("ERROR: set WORKER_ID or pass --worker.", flush=True)
@@ -208,7 +209,6 @@ def run_wait_loop(args: argparse.Namespace) -> int:
                 scorer=scorer,
                 practice=practice,
                 root=root,
-                rounds_override=args.rounds,
                 worker_id=worker_id,
             )
         except KeyboardInterrupt:
@@ -231,19 +231,15 @@ def _run_assigned_job(
     scorer: Path,
     practice: Path,
     root: Path,
-    rounds_override: int,
     worker_id: str,
 ) -> int:
     from tuner.jobs import finish_owned_job
 
     config_id = str(job.get("id") or "")
     updates = job.get("gatk_updates") if isinstance(job.get("gatk_updates"), dict) else {}
-    rounds = int(rounds_override or job.get("rounds_target") or 15)
-    offset = int(job.get("rounds_offset") or 0)
     experiment = job.get("experiment") or config_id
     print(
-        f"\n   job {config_id}  {experiment}  rounds={rounds}  "
-        f"offset={offset}  updates={updates}",
+        f"\n   job {config_id}  {experiment}  updates={updates}",
         flush=True,
     )
 
@@ -273,9 +269,9 @@ def _run_assigned_job(
         gatk_params = read_gatk_conf(conf)
         stage = root / "datasets" / "practice_fleet"
         try:
-            n_rounds = stage_practice_rounds(practice, stage, rounds, offset)
+            n_rounds = stage_practice_rounds(practice, stage)
         except OSError as e:
-            print(f"ERROR: could not stage {rounds} rounds: {e}", flush=True)
+            print(f"ERROR: could not stage practice rounds: {e}", flush=True)
             _finish({"status": "failed", "gatk_config": gatk_params})
             return 1
         if n_rounds <= 0:
@@ -314,8 +310,8 @@ def _run_assigned_job(
             print(f"ERROR: could not restore {conf}: {e}", flush=True)
 
 
-def stage_practice_rounds(practice: Path, stage: Path, limit: int, offset: int = 0) -> int:
-    """Link one shared slice of practice rounds so every VPS scores the same set."""
+def stage_practice_rounds(practice: Path, stage: Path) -> int:
+    """Link every complete practice round so every VPS scores the same set."""
     if not practice.is_dir():
         print(f"ERROR: practice directory not found: {practice}", flush=True)
         return 0
@@ -325,15 +321,8 @@ def stage_practice_rounds(practice: Path, stage: Path, limit: int, offset: int =
     else:
         stage.mkdir(parents=True, exist_ok=True)
     chosen = [folder for folder in sorted(practice.iterdir()) if _is_round_folder(folder)]
-    start = max(0, int(offset))
-    chosen = chosen[start : start + max(1, int(limit))]
     for folder in chosen:
         _link_dir(folder.resolve(), stage / folder.name)
-    if len(chosen) < limit:
-        print(
-            f"   WARNING: only {len(chosen)} practice round(s); requested {limit}",
-            flush=True,
-        )
     return len(chosen)
 
 
@@ -436,12 +425,6 @@ def _parse_args() -> argparse.Namespace:
         "--worker",
         default=os.environ.get("WORKER_ID") or "",
         help="VPS id that matches TUNER_WORKERS (default: WORKER_ID).",
-    )
-    p.add_argument(
-        "--rounds",
-        type=int,
-        default=0,
-        help="Practice rounds to score. 0 uses the job's rounds_target (15).",
     )
     p.add_argument("--poll", type=int, default=int(os.environ.get("FLEET_POLL_SEC") or 20))
     return p.parse_args()

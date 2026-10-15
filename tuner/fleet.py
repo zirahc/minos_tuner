@@ -4,11 +4,9 @@
 
 The agent chooses one category to vary. Each trial writes every catalog
 parameter: the best scored config, with that category's new values on top.
-Each trial first scores FLEET_ROUNDS practice rounds.
-The top quarter of that stack then scores the next FLEET_ROUNDS
-folders. Optuna is told after that check. A free VPS takes the next
-trial immediately. When the stack and its checks are done, the agent
-builds the next stack.
+Each trial scores every practice round in the folder. Optuna is told
+when that score is in. A free VPS takes the next trial immediately.
+When the stack is done, the agent builds the next stack.
 
 Stop with Ctrl+C. GATK machines run: python main.py
 A machine posts its WORKER_ID while main.py is running. The fleet
@@ -54,7 +52,6 @@ from tuner.jobs import (
     list_open_jobs,
     list_queued,
     release_offline_job,
-    requeue_confirmation,
 )
 from tuner.search_box import MAX_TRIALS, load_search_box, optuna_distributions
 from tuner.spaces import (
@@ -81,16 +78,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
     print(
         f"   fleet reads online workers from gatk_workers  stack={args.batch}  "
-        f"rounds={args.rounds}  poll={args.poll}s",
+        f"poll={args.poll}s",
         flush=True,
     )
     print("   a machine that runs main.py is given the next trial", flush=True)
-    print(
-        f"   every trial scores {args.rounds} round(s); the top quarter then "
-        f"scores the next {args.rounds}",
-        flush=True,
-    )
-    print("   the agent runs again after those checks finish", flush=True)
+    print("   every trial scores every practice round in the folder", flush=True)
+    print("   the agent runs again after the stack finishes", flush=True)
     print("   GATK VPS: set WORKER_ID and run python main.py", flush=True)
     print("   stop with Ctrl+C", flush=True)
     while True:
@@ -124,7 +117,6 @@ def run_once(args: argparse.Namespace) -> int:
         if queued is None or inflight is None:
             return 2
     watching = {str(job.get("id")): job for job in inflight if job.get("id")}
-    screened: Dict[str, Dict[str, Any]] = {}
     seen_online: Optional[List[str]] = None
     print(
         f"   stack={len(queued)}  running={len(watching)}",
@@ -182,30 +174,16 @@ def run_once(args: argparse.Namespace) -> int:
             status = str((row or {}).get("status") or "")
             if status in TERMINAL:
                 score = (row or {}).get("avg_combined_final")
-                offset = int(job.get("rounds_offset") or (row or {}).get("rounds_offset") or 0)
                 print(
                     f"   worker={job.get('worker_id')} {status} "
-                    f"n_scored={(row or {}).get('n_scored')} avg={score} offset={offset}",
+                    f"n_scored={(row or {}).get('n_scored')} avg={score}",
                     flush=True,
                 )
-                if status == "scored" and offset <= 0:
-                    screened[config_id] = job
-                    continue
                 _tell_jobs([job])
                 continue
             still[config_id] = job
         watching = still
         if not watching and not queued:
-            if screened:
-                queued = _confirm_high_scores(screened, args.rounds)
-                screened = {}
-                if queued:
-                    print(
-                        f"   confirming {len(queued)} high score(s) on the next "
-                        f"{args.rounds} round(s)",
-                        flush=True,
-                    )
-                    continue
             print("   stack finished — agent will set the next trials", flush=True)
             return 0
         waiting = ",".join(str(job.get("worker_id")) for job in watching.values())
@@ -226,85 +204,6 @@ def run_once(args: argparse.Namespace) -> int:
             return 2
         assigned_ids = set(watching)
         queued = [row for row in refreshed if str(row.get("id") or "") not in assigned_ids]
-
-
-def _confirm_high_scores(
-    screened: Dict[str, Dict[str, Any]],
-    rounds: int,
-) -> List[Dict[str, Any]]:
-    """Confirm only a screen that beats the current best by more than MIN_GAIN.
-
-    A gap of 0.01 or less is told from the first rounds and the category ends.
-    """
-    ranked: List[tuple] = []
-    for config_id, job in screened.items():
-        row = fetch_score_row(config_id) or {}
-        try:
-            score = float(row.get("avg_combined_final"))
-        except (TypeError, ValueError):
-            _tell_jobs([job])
-            continue
-        ranked.append((score, config_id, job))
-    if not ranked:
-        return []
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    baseline = _baseline_score(set(screened))
-    best = ranked[0][0]
-    if baseline is not None and best <= baseline + MIN_GAIN:
-        print(
-            f"   screen best={best:.4f} is within {MIN_GAIN:.2f} of {baseline:.4f}; "
-            "not continuing this experiment",
-            flush=True,
-        )
-        for _score, _config_id, job in ranked:
-            _tell_jobs([job])
-        return []
-    raised = [
-        item for item in ranked
-        if baseline is None or item[0] > baseline + MIN_GAIN
-    ]
-    keep = max(1, math.ceil(len(ranked) * 0.25))
-    raised = raised[:keep]
-    base_txt = f"{baseline:.4f}" if baseline is not None else "none"
-    print(
-        f"   screen best={best:.4f} beats {base_txt} by more than {MIN_GAIN:.2f}; "
-        f"confirming {len(raised)} trial(s)",
-        flush=True,
-    )
-    queued: List[Dict[str, Any]] = []
-    confirm_ids = {config_id for _score, config_id, _job in raised}
-    for score, config_id, job in ranked:
-        if config_id not in confirm_ids:
-            _tell_jobs([job])
-            continue
-        updated = requeue_confirmation(config_id, rounds)
-        if not updated:
-            print(f"   could not requeue {config_id}; telling the first screen", flush=True)
-            _tell_jobs([job])
-            continue
-        print(f"   confirm trial={job.get('optuna_trial_number')} avg={score:.4f}", flush=True)
-        queued.append(updated)
-    return queued
-
-
-def _baseline_score(exclude: set) -> Optional[float]:
-    """Best avg_combined_final outside the trials just screened."""
-    rows = fetch_config_scores(
-        category=None,
-        scored_only=True,
-        limit=30,
-        order="avg_combined_final.desc",
-    )
-    if not rows:
-        return None
-    for row in rows:
-        if str(row.get("config_id") or "") in exclude:
-            continue
-        try:
-            return float(row.get("avg_combined_final"))
-        except (TypeError, ValueError):
-            continue
-    return None
 
 
 def _build_stack(args: argparse.Namespace) -> bool:
@@ -495,13 +394,12 @@ def _build_stack(args: argparse.Namespace) -> bool:
             box=box,
             trial_number=int(trial.number),
             batch_id=batch_id,
-            rounds_target=args.rounds,
             status="queued",
         )
         if not config_id:
             print(
                 "   ERROR: could not insert job. Re-run gatk_tuning.sql so "
-                "worker_id, batch_id, rounds_target exist.",
+                "worker_id and batch_id exist.",
                 flush=True,
             )
             _tell_state(study, trial.number, TrialState.FAIL)
@@ -821,12 +719,6 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         type=int,
         default=int(os.environ.get("FLEET_BATCH") or 8),
         help="Trials placed on the stack before the agent runs again.",
-    )
-    p.add_argument(
-        "--rounds",
-        type=int,
-        default=int(os.environ.get("FLEET_ROUNDS") or 15),
-        help="Practice rounds each VPS scores for one setting.",
     )
     p.add_argument("--poll", type=int, default=int(os.environ.get("FLEET_POLL_SEC") or 20))
     return p.parse_args(argv)
