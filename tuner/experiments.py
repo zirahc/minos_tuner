@@ -39,7 +39,10 @@ def _one(index: int, item: Any) -> Dict[str, Any]:
         raise ValueError(f"{name}: hypothesis is required")
     updates = item.get("updates")
     category = str(item.get("search_category") or "").strip()
+    space_in = item.get("space")
     if isinstance(updates, dict) and updates:
+        if isinstance(space_in, dict) and space_in:
+            raise ValueError(f"{name}: set updates or space, not both")
         coerced = {str(key): _exact_value(str(key), value) for key, value in updates.items()}
         return {
             "kind": "fixed",
@@ -48,14 +51,16 @@ def _one(index: int, item: Any) -> Dict[str, Any]:
             "category": category or _category_for(name, coerced),
             "updates": coerced,
         }
+    if isinstance(space_in, dict) and space_in:
+        category = category or _category_for(name, space_in)
     if category:
         return {
             "kind": "screen",
             "name": name,
             "hypothesis": hypothesis,
-            "box": _screen_box(name, category, hypothesis),
+            "box": _screen_box(name, category, hypothesis, space_in),
         }
-    raise ValueError(f"{name}: set updates or search_category")
+    raise ValueError(f"{name}: set updates, space, or search_category")
 
 
 def _category_for(name: str, updates: Dict[str, Any]) -> str:
@@ -67,31 +72,117 @@ def _category_for(name: str, updates: Dict[str, Any]) -> str:
     return name
 
 
-def _screen_box(name: str, category: str, hypothesis: str) -> Dict[str, Any]:
-    if category not in SPACES:
+def catalog_name(label: str) -> str:
+    """quality_filters_1 and quality_filters_20261015T211500Z both use quality_filters."""
+    text = str(label or "").strip()
+    if text in SPACES:
+        return text
+    found = ""
+    for name in SPACES:
+        if text.startswith(name + "_") and len(name) > len(found):
+            found = name
+    return found
+
+
+def _identity(name: str, category: str, catalog: str) -> str:
+    """A suffix or timeslot is its own pass. The bare catalog name stays shared."""
+    for label in (category, name):
+        if catalog_name(label) == catalog and label != catalog:
+            return label
+    return catalog
+
+
+def _screen_box(
+    name: str,
+    category: str,
+    hypothesis: str,
+    space_in: Any = None,
+) -> Dict[str, Any]:
+    catalog = catalog_name(category) or catalog_name(name)
+    if not catalog:
         known = ", ".join(sorted(SPACES))
         raise ValueError(f"{name}: unknown search_category {category!r}. known: {known}")
-    space = {
-        key: spec
-        for key, spec in specs_to_space_json(space_for(category)).items()
-        if not held_at_default(key)
-    }
+    identity = _identity(name, category, catalog)
+    space = _experiment_space(name, catalog, space_in)
     if not space:
         raise ValueError(
-            f"{name}: {category} has no numeric parameter. "
+            f"{name}: {catalog} has no numeric parameter. "
             "Set that choice under updates."
         )
     box = validate_search_box({
-        "search_category": category,
+        "search_category": catalog,
         "hypothesis": hypothesis,
         "space": space,
         "constraints": {},
         "n_trials": enough_trials(space),
         "optimize": "avg_combined_final",
     })
+    box["space"] = space
+    box["n_trials"] = enough_trials(space)
+    box["search_category"] = identity
+    box["catalog_category"] = catalog
+    if identity != catalog:
+        box["pass_id"] = identity
     box["suggested_by"] = "experiments.json"
     box["manual_name"] = name
     return box
+
+
+def _experiment_space(name: str, catalog: str, space_in: Any) -> Dict[str, Any]:
+    """File ranges replace the catalog grid. Omitted space keeps the catalog steps."""
+    allowed = space_for(catalog)
+    if not isinstance(space_in, dict) or not space_in:
+        return {
+            key: spec
+            for key, spec in specs_to_space_json(allowed).items()
+            if not held_at_default(key)
+        }
+    out: Dict[str, Any] = {}
+    for key, raw in space_in.items():
+        if key not in allowed:
+            raise ValueError(f"{name}: {key} is not in {catalog}")
+        if not isinstance(raw, dict):
+            raise ValueError(f"{name}: space.{key} must be an object with low, high, and step")
+        spec = allowed[key]
+        if spec.kind == "categorical":
+            raise ValueError(f"{name}: set {key} under updates. It is a choice, not a range.")
+        out[key] = _range_item(name, key, spec, raw)
+    return out
+
+
+def _range_item(name: str, key: str, spec: Any, raw: Dict[str, Any]) -> Dict[str, Any]:
+    low = raw.get("low", spec.low)
+    high = raw.get("high", spec.high)
+    try:
+        low_f = float(low)
+        high_f = float(high)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{name}: {key} low and high must be numbers") from e
+    if spec.low is not None and low_f < float(spec.low):
+        raise ValueError(f"{name}: {key} low {low_f} is below {spec.low}")
+    if spec.high is not None and high_f > float(spec.high):
+        raise ValueError(f"{name}: {key} high {high_f} is above {spec.high}")
+    if low_f > high_f:
+        raise ValueError(f"{name}: {key} low is above high")
+    if spec.kind == "int":
+        low_v: Any = int(round(low_f))
+        high_v: Any = int(round(high_f))
+    else:
+        low_v = low_f
+        high_v = high_f
+    item: Dict[str, Any] = {"type": spec.kind, "low": low_v, "high": high_v}
+    if "step" not in raw or raw.get("step") is None:
+        raise ValueError(f"{name}: {key} needs a step")
+    try:
+        step = float(raw["step"])
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{name}: {key} step must be a number") from e
+    if step <= 0:
+        raise ValueError(f"{name}: {key} step must be greater than 0")
+    if spec.kind == "int" and step != int(step):
+        raise ValueError(f"{name}: {key} step must be a whole number")
+    item["step"] = int(step) if spec.kind == "int" else step
+    return item
 
 
 def _exact_value(key: str, raw: Any) -> Any:

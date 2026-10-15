@@ -62,6 +62,26 @@ def insert_pending_config(
     return _row_id(inserted)
 
 
+def experiment_name_exists(name: str) -> Optional[bool]:
+    """True when experiments.json name already has a gatk_configs row.
+
+    A screen is stored as name-t0, name-t1, and so on. None means the read failed.
+    """
+    label = str(name or "").strip()
+    if not label:
+        return False
+    quoted = urllib.parse.quote(label, safe="")
+    query = "&".join([
+        "select=experiment",
+        f"or=(experiment.eq.{quoted},experiment.like.{quoted}-t*)",
+        "limit=1",
+    ])
+    data = rest_json("GET", config_table(), query=query)
+    if data is None:
+        return None
+    return isinstance(data, list) and bool(data)
+
+
 def list_pending(limit: int = 1) -> List[Dict[str, Any]]:
     """Unassigned pending rows. Fleet jobs carry a worker_id and are left for main.py."""
     query = "&".join([

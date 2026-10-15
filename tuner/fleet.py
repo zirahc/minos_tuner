@@ -50,6 +50,7 @@ from tuner.jobs import (
     assign_queued,
     config_for_trial,
     fetch_score_row,
+    experiment_name_exists,
     insert_pending_config,
     list_online_workers,
     list_open_jobs,
@@ -236,6 +237,16 @@ def _build_stack(args: argparse.Namespace) -> Optional[bool]:
             f"   file experiment {item['name']}: {item['hypothesis']}",
             flush=True,
         )
+        seen = experiment_name_exists(item["name"])
+        if seen is None:
+            print(f"ERROR: could not look up {item['name']} in gatk_configs", flush=True)
+            return False
+        if seen:
+            print(
+                f"   {item['name']} is already in gatk_configs; ignoring it",
+                flush=True,
+            )
+            continue
         if item["kind"] == "fixed":
             outcome = _enqueue_fixed(args, item)
         else:
@@ -250,7 +261,7 @@ def _build_stack(args: argparse.Namespace) -> Optional[bool]:
         )
     if listed:
         print(
-            "   file experiments are already scored on this base; asking the agent",
+            "   no new file experiment to run; asking the agent",
             flush=True,
         )
     skipped = [str(name) for name in (getattr(args, "scored_categories", None) or [])]
@@ -442,7 +453,8 @@ def _enqueue_box(
         order="avg_combined_final.desc",
     )
     base, best_row = best_base_updates(best_rows if best_rows else history)
-    known = _known_settings(study, past, space_keys, base)
+    pass_id = str(box.get("pass_id") or "")
+    known = _known_settings(study, past, space_keys, base, pass_id)
     if is_agent_experiment(category):
         remembered = remember_scores(
             study,
@@ -452,9 +464,10 @@ def _enqueue_box(
         )
         if remembered:
             print(f"   remembered {remembered} scored setting(s) from history", flush=True)
-            known = _known_settings(study, past, space_keys, base)
+            known = _known_settings(study, past, space_keys, base, pass_id)
+    scope = f" in {pass_id}" if pass_id else ""
     print(
-        f"   {len(known)} setting(s) already scored on the current base; "
+        f"   {len(known)} setting(s) already scored on the current base{scope}; "
         "the same values on an older base are run again",
         flush=True,
     )
@@ -573,22 +586,29 @@ def _known_settings(
     history: List[Dict[str, Any]],
     keys: List[str],
     base: Dict[str, Any],
+    pass_id: str = "",
 ) -> Dict[tuple, tuple]:
     """Varied settings already scored on this base.
 
     The value is (params, score). A past quality-filter value does not count
     after assembly or priors change the other parameters: that is a new config.
-    A finished Optuna trial stores only the varied keys, so it cannot decide
-    this. Open trials still count, so the same stack is not queued twice.
+    quality_filters_1 does not reuse rows stored as quality_filters or
+    quality_filters_2. A finished Optuna trial stores only the varied keys,
+    so it cannot decide this. Open trials still count, so the same stack is
+    not queued twice.
     """
     varied = set(keys)
     known: Dict[tuple, tuple] = {}
     cache: Dict[str, set] = {}
     for row in history:
+        if pass_id and not _row_is_pass(row, pass_id):
+            continue
         if not _on_base(row, base, varied):
             continue
-        if not keys or not all(
-            _row_informs_param(history, row, key, category_of(key), cache) for key in keys
+        if not pass_id and (
+            not keys or not all(
+                _row_informs_param(history, row, key, category_of(key), cache) for key in keys
+            )
         ):
             continue
         params = _params_for_keys(row, keys)
@@ -603,6 +623,12 @@ def _known_settings(
             continue
         _remember_setting(known, {key: raw[key] for key in keys}, None)
     return known
+
+
+def _row_is_pass(row: Dict[str, Any], pass_id: str) -> bool:
+    stored = str(row.get("search_category") or "")
+    study = str(row.get("study_name") or "")
+    return stored == pass_id or study == pass_id or study == default_study_name(pass_id)
 
 
 def _on_base(row: Dict[str, Any], base: Dict[str, Any], varied: set) -> bool:
