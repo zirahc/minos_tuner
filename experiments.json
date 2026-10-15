@@ -1,0 +1,4 @@
+{
+  "note": "The tuner runs this list before it asks the agent. An empty list lets the agent choose. Other parameters stay at the highest avg_combined_final. A setting already scored on that config is skipped, and it runs again after another category changes the config. One fixed trial: {\"name\": \"pcr-none\", \"hypothesis\": \"PCR-free reads. NONE keeps 1bp indel recall.\", \"updates\": {\"pcr_indel_model\": \"NONE\"}}. One category screen: {\"name\": \"quality-again\", \"hypothesis\": \"Screen quality filters on the current best config.\", \"search_category\": \"quality_filters\"}.",
+  "experiments": []
+}

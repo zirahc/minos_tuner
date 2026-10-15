@@ -2,7 +2,9 @@
 
   python -m tuner.fleet
 
-The agent chooses one category to vary. Each trial writes every catalog
+experiments.json is checked first. Those experiments run before the agent.
+The agent chooses one category to vary when that list is empty or already
+scored. Each trial writes every catalog
 parameter: the best scored config, with that category's new values on top.
 Each trial scores every practice round in the folder. Optuna is told
 when that score is in. A free VPS takes the next trial immediately.
@@ -43,6 +45,7 @@ from tuner.adapter import (
     remember_scores,
 )
 from tuner.agent import main as agent_main
+from tuner.experiments import load_experiments
 from tuner.jobs import (
     assign_queued,
     config_for_trial,
@@ -69,6 +72,7 @@ from tuner.steps import MIN_GAIN, _row_informs_param
 from tuner.supabase_scores import fetch_config_scores
 
 DEFAULT_BOX = TUNER_ROOT / "search_box.json"
+DEFAULT_EXPERIMENTS = TUNER_ROOT / "experiments.json"
 TERMINAL = ("scored", "failed")
 
 
@@ -84,6 +88,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     print("   a machine that runs main.py is given the next trial", flush=True)
     print("   every trial scores every practice round in the folder", flush=True)
+    print("   experiments.json runs before the agent when it lists experiments", flush=True)
     print("   the agent runs again after the stack finishes", flush=True)
     print("   GATK VPS: set WORKER_ID and run python main.py", flush=True)
     print("   stop with Ctrl+C", flush=True)
@@ -208,15 +213,118 @@ def run_once(args: argparse.Namespace) -> int:
 
 
 def _build_stack(args: argparse.Namespace) -> bool:
-    rc = agent_main([])
-    if rc != 0:
-        print("   agent did not write a search box", flush=True)
-        return False
     try:
-        box = load_search_box(Path(args.box))
-    except (OSError, ValueError) as e:
-        print(f"ERROR: search box: {e}", flush=True)
+        listed = load_experiments(Path(args.experiments))
+    except ValueError as e:
+        print(f"ERROR: {e}", flush=True)
         return False
+    for item in listed:
+        print(
+            f"   file experiment {item['name']}: {item['hypothesis']}",
+            flush=True,
+        )
+        if item["kind"] == "fixed":
+            outcome = _enqueue_fixed(args, item)
+        else:
+            outcome = _enqueue_box(args, item["box"])
+        if outcome is True:
+            return True
+        if outcome is False:
+            return False
+        print(
+            f"   {item['name']} is already scored on the current base",
+            flush=True,
+        )
+    if listed:
+        print(
+            "   file experiments are already scored on this base; asking the agent",
+            flush=True,
+        )
+    return _enqueue_box(args, None) is True
+
+
+def _enqueue_fixed(args: argparse.Namespace, item: Dict[str, Any]) -> Optional[bool]:
+    """Queue one exact config. None means that config is already scored or running."""
+    past = fetch_config_scores(category=None, scored_only=False)
+    if past is None:
+        return False
+    history = [row for row in past if _score_of(row) is not None]
+    best_rows = fetch_config_scores(
+        category=None,
+        scored_only=True,
+        limit=1,
+        order="avg_combined_final.desc",
+    )
+    base, best_row = best_base_updates(best_rows if best_rows else history)
+    updates = dict(base)
+    updates.update(item["updates"])
+    if _config_seen(past, updates):
+        return None
+    if best_row is None:
+        print(f"   base config is the catalog default ({len(base)} parameters)", flush=True)
+    else:
+        print(
+            f"   default config is the highest avg_combined_final: "
+            f"{best_row.get('experiment')} "
+            f"{float(best_row.get('avg_combined_final')):.4f}. "
+            f"{item['name']} sets {item['updates']}.",
+            flush=True,
+        )
+    box = {
+        "search_category": item["category"],
+        "hypothesis": item["hypothesis"],
+        "suggested_by": "experiments.json",
+        "study_name": item["name"],
+    }
+    config_id = insert_pending_config(
+        experiment=item["name"],
+        updates=updates,
+        box=box,
+        trial_number=0,
+        status="queued",
+    )
+    if not config_id:
+        print(
+            "   ERROR: could not insert job. Re-run gatk_tuning.sql so "
+            "worker_id and batch_id exist.",
+            flush=True,
+        )
+        return False
+    print(f"   placed {item['name']} on the stack  config_id={config_id}", flush=True)
+    return True
+
+
+def _config_seen(rows: List[Dict[str, Any]], updates: Dict[str, Any]) -> bool:
+    """True when this full config is already scored or still in the stack."""
+    wanted = param_signature({key: value for key, value in updates.items() if spec_of(key)})
+    for row in rows:
+        if _score_of(row) is None and str(row.get("status") or "") not in ("queued", "pending", "running"):
+            continue
+        full = full_params_from_row(row)
+        current = param_signature({key: value for key, value in full.items() if spec_of(key)})
+        if current == wanted:
+            return True
+    return False
+
+
+def _enqueue_box(
+    args: argparse.Namespace,
+    preset: Optional[Dict[str, Any]],
+) -> Optional[bool]:
+    """Queue one search box. None means that box is already scored on this base."""
+    if preset is None:
+        rc = agent_main([])
+        if rc != 0:
+            print("   agent did not write a search box", flush=True)
+            return False
+        try:
+            box = load_search_box(Path(args.box))
+        except (OSError, ValueError) as e:
+            print(f"ERROR: search box: {e}", flush=True)
+            return False
+    else:
+        box = dict(preset)
+        box["space"] = dict(preset.get("space") or {})
     try:
         import optuna
         from optuna.trial import TrialState
@@ -339,7 +447,7 @@ def _build_stack(args: argparse.Namespace) -> bool:
             "it runs again after another category changes that base",
             flush=True,
         )
-        return False
+        return None
 
     if best_row is None:
         print(f"   base config is the catalog default ({len(base)} parameters)", flush=True)
@@ -384,7 +492,8 @@ def _build_stack(args: argparse.Namespace) -> bool:
         known[signature] = (params, None)
         updates = dict(base)
         updates.update(params)
-        experiment = f"optuna-{category}-t{trial.number}"
+        label = str(box.get("manual_name") or f"optuna-{category}")
+        experiment = f"{label}-t{trial.number}"
         print(
             f"   stack [{placed + 1}/{target}] trial={trial.number} "
             f"vary={params}  full_keys={len(updates)}",
@@ -716,6 +825,11 @@ def _enumerate_settings(space: Dict[str, Any]) -> List[Dict[str, Any]]:
 def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run the GATK tuning stack until Ctrl+C.")
     p.add_argument("--box", default=str(DEFAULT_BOX))
+    p.add_argument(
+        "--experiments",
+        default=str(DEFAULT_EXPERIMENTS),
+        help="JSON list of experiments to run before the agent.",
+    )
     p.add_argument("--study", default=None)
     p.add_argument(
         "--workers",
