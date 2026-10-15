@@ -1,6 +1,5 @@
 {
 	"min_pruning": 2,
-	"sample_ploidy": 2,
 	"heterozygosity": 0.0005,
 	"pcr_indel_model": "CONSERVATIVE",
 	"emit_ref_confidence": "NONE",
@@ -13,7 +12,6 @@
 	"min_assembly_region_size": 51,
 	"min_mapping_quality_score": 56,
 	"min_dangling_branch_length": 2,
-	"dont_use_soft_clipped_bases": false,
 	"active_probability_threshold": 0.01,
 	"base_quality_score_threshold": 13,
 	"max_reads_per_alignment_start": 125,
