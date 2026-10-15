@@ -6,7 +6,37 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from tuner.search_box import enough_trials, specs_to_space_json, validate_search_box
-from tuner.spaces import SPACES, category_of, coerce_param, held_at_default, space_for, spec_of
+from tuner.spaces import (
+    SPACES,
+    catalog_defaults,
+    category_of,
+    coerce_param,
+    held_at_default,
+    space_for,
+    spec_of,
+)
+
+
+def load_gatk_config(path: Path) -> Dict[str, Any]:
+    """Base GATK parameters for experiments.json. Missing keys stay at the catalog default."""
+    if not path.is_file():
+        raise ValueError(
+            f"{path.name} was not found. experiments.json trials use that file as the base config."
+        )
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise ValueError(f"could not read {path.name}: {e}") from e
+    if isinstance(raw, dict) and isinstance(raw.get("gatk_config"), dict):
+        raw = raw["gatk_config"]
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError(f"{path.name} must be an object of GATK parameters")
+    params = catalog_defaults()
+    for key, value in raw.items():
+        if str(key) == "note":
+            continue
+        params[str(key)] = _exact_value(str(key), value)
+    return params
 
 
 def load_experiments(path: Path) -> List[Dict[str, Any]]:

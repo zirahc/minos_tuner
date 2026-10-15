@@ -45,7 +45,7 @@ from tuner.adapter import (
     remember_scores,
 )
 from tuner.agent import main as agent_main
-from tuner.experiments import load_experiments
+from tuner.experiments import load_experiments, load_gatk_config
 from tuner.jobs import (
     assign_queued,
     config_for_trial,
@@ -74,6 +74,7 @@ from tuner.supabase_scores import fetch_config_scores
 
 DEFAULT_BOX = TUNER_ROOT / "search_box.json"
 DEFAULT_EXPERIMENTS = TUNER_ROOT / "experiments.json"
+DEFAULT_GATK_CONFIG = TUNER_ROOT / "gatk_config.json"
 TERMINAL = ("scored", "failed")
 
 
@@ -89,8 +90,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     print("   a machine that runs main.py is given the next trial", flush=True)
     print("   every trial scores every practice round in the folder", flush=True)
-    print("   experiments.json runs before the agent when it lists experiments", flush=True)
-    print("   the agent runs again after the stack finishes", flush=True)
+    print("   experiments.json starts from gatk_config.json", flush=True)
+    if _agent_enabled():
+        print("   the agent runs after the file experiments, then again when the stack finishes", flush=True)
+    else:
+        print("   AGENT is false; the agent is off and only experiments.json is queued", flush=True)
     print("   GATK VPS: set WORKER_ID and run python main.py", flush=True)
     print("   stop with Ctrl+C", flush=True)
     args.scored_categories = []
@@ -111,10 +115,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             time.sleep(60)
             continue
         if rc == 3:
-            print(
-                "   no unscored settings on the current base — retrying in 60s",
-                flush=True,
-            )
+            if _agent_enabled():
+                print(
+                    "   no unscored settings on the current base — retrying in 60s",
+                    flush=True,
+                )
+            else:
+                print(
+                    "   experiments.json has nothing new to queue — retrying in 60s",
+                    flush=True,
+                )
             time.sleep(60)
             continue
         if rc != 0:
@@ -204,7 +214,10 @@ def run_once(args: argparse.Namespace) -> int:
             still[config_id] = job
         watching = still
         if not watching and not queued:
-            print("   stack finished — agent will set the next trials", flush=True)
+            if _agent_enabled():
+                print("   stack finished — agent will set the next trials", flush=True)
+            else:
+                print("   stack finished — next cycle reads experiments.json", flush=True)
             return 0
         waiting = ",".join(str(job.get("worker_id")) for job in watching.values())
         if queued and not free:
@@ -232,6 +245,18 @@ def _build_stack(args: argparse.Namespace) -> Optional[bool]:
     except ValueError as e:
         print(f"ERROR: {e}", flush=True)
         return False
+    file_base: Optional[Dict[str, Any]] = None
+    if listed:
+        try:
+            file_base = load_gatk_config(Path(args.gatk_config))
+        except ValueError as e:
+            print(f"ERROR: {e}", flush=True)
+            return False
+        print(
+            f"   base config read from {Path(args.gatk_config).name} "
+            f"({len(file_base)} parameters)",
+            flush=True,
+        )
     for item in listed:
         print(
             f"   file experiment {item['name']}: {item['hypothesis']}",
@@ -248,9 +273,9 @@ def _build_stack(args: argparse.Namespace) -> Optional[bool]:
             )
             continue
         if item["kind"] == "fixed":
-            outcome = _enqueue_fixed(args, item)
+            outcome = _enqueue_fixed(args, item, file_base)
         else:
-            outcome = _enqueue_box(args, item["box"])
+            outcome = _enqueue_box(args, item["box"], base_override=file_base)
         if outcome is True:
             return True
         if outcome is False:
@@ -259,6 +284,9 @@ def _build_stack(args: argparse.Namespace) -> Optional[bool]:
             f"   {item['name']} is already scored on the current base",
             flush=True,
         )
+    if not _agent_enabled():
+        print("   agent is off; tuning stays on experiments.json", flush=True)
+        return None
     if listed:
         print(
             "   no new file experiment to run; asking the agent",
@@ -290,24 +318,38 @@ def _build_stack(args: argparse.Namespace) -> Optional[bool]:
     return None
 
 
-def _enqueue_fixed(args: argparse.Namespace, item: Dict[str, Any]) -> Optional[bool]:
+def _enqueue_fixed(
+    args: argparse.Namespace,
+    item: Dict[str, Any],
+    file_base: Optional[Dict[str, Any]] = None,
+) -> Optional[bool]:
     """Queue one exact config. None means that config is already scored or running."""
     past = fetch_config_scores(category=None, scored_only=False)
     if past is None:
         return False
     history = [row for row in past if _score_of(row) is not None]
-    best_rows = fetch_config_scores(
-        category=None,
-        scored_only=True,
-        limit=1,
-        order="avg_combined_final.desc",
-    )
-    base, best_row = best_base_updates(best_rows if best_rows else history)
+    if file_base is not None:
+        base = dict(file_base)
+        best_row = None
+    else:
+        best_rows = fetch_config_scores(
+            category=None,
+            scored_only=True,
+            limit=1,
+            order="avg_combined_final.desc",
+        )
+        base, best_row = best_base_updates(best_rows if best_rows else history)
     updates = dict(base)
     updates.update(item["updates"])
     if _config_seen(past, updates):
         return None
-    if best_row is None:
+    if file_base is not None:
+        print(
+            f"   base config is gatk_config.json ({len(base)} parameters). "
+            f"{item['name']} sets {item['updates']}.",
+            flush=True,
+        )
+    elif best_row is None:
         print(f"   base config is the catalog default ({len(base)} parameters)", flush=True)
     else:
         print(
@@ -358,6 +400,7 @@ def _enqueue_box(
     args: argparse.Namespace,
     preset: Optional[Dict[str, Any]],
     skip: Optional[List[str]] = None,
+    base_override: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Queue one search box.
 
@@ -446,13 +489,17 @@ def _enqueue_box(
             study, optuna, study_name, storage, distributions
         )
 
-    best_rows = fetch_config_scores(
-        category=None,
-        scored_only=True,
-        limit=1,
-        order="avg_combined_final.desc",
-    )
-    base, best_row = best_base_updates(best_rows if best_rows else history)
+    if base_override is not None:
+        base = dict(base_override)
+        best_row = None
+    else:
+        best_rows = fetch_config_scores(
+            category=None,
+            scored_only=True,
+            limit=1,
+            order="avg_combined_final.desc",
+        )
+        base, best_row = best_base_updates(best_rows if best_rows else history)
     pass_id = str(box.get("pass_id") or "")
     known = _known_settings(study, past, space_keys, base, pass_id)
     if is_agent_experiment(category):
@@ -504,7 +551,13 @@ def _enqueue_box(
         )
         return str(category)
 
-    if best_row is None:
+    if base_override is not None:
+        print(
+            f"   base config is gatk_config.json ({len(base)} parameters). "
+            f"This stack varies {category}; every other parameter stays in that file.",
+            flush=True,
+        )
+    elif best_row is None:
         print(f"   base config is the catalog default ({len(base)} parameters)", flush=True)
     else:
         print(
@@ -894,6 +947,11 @@ def _enumerate_settings(space: Dict[str, Any]) -> List[Dict[str, Any]]:
     return rows
 
 
+def _agent_enabled() -> bool:
+    raw = (os.environ.get("AGENT") or "true").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run the GATK tuning stack until Ctrl+C.")
     p.add_argument("--box", default=str(DEFAULT_BOX))
@@ -901,6 +959,11 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         "--experiments",
         default=str(DEFAULT_EXPERIMENTS),
         help="JSON list of experiments to run before the agent.",
+    )
+    p.add_argument(
+        "--gatk-config",
+        default=str(DEFAULT_GATK_CONFIG),
+        help="Base GATK parameters for experiments.json.",
     )
     p.add_argument("--study", default=None)
     p.add_argument(
