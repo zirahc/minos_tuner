@@ -56,6 +56,7 @@ from tuner.jobs import (
 from tuner.search_box import MAX_TRIALS, load_search_box, optuna_distributions
 from tuner.spaces import (
     best_base_updates,
+    full_params_from_row,
     categories_touched,
     category_of,
     coerce_param,
@@ -284,7 +285,14 @@ def _build_stack(args: argparse.Namespace) -> bool:
             study, optuna, study_name, storage, distributions
         )
 
-    known = _known_settings(study, past, space_keys)
+    best_rows = fetch_config_scores(
+        category=None,
+        scored_only=True,
+        limit=1,
+        order="avg_combined_final.desc",
+    )
+    base, best_row = best_base_updates(best_rows if best_rows else history)
+    known = _known_settings(study, past, space_keys, base)
     if is_agent_experiment(category):
         remembered = remember_scores(
             study,
@@ -294,9 +302,10 @@ def _build_stack(args: argparse.Namespace) -> bool:
         )
         if remembered:
             print(f"   remembered {remembered} scored setting(s) from history", flush=True)
-            known = _known_settings(study, past, space_keys)
+            known = _known_settings(study, past, space_keys, base)
     print(
-        f"   history already contains {len(known)} setting(s); those trials are skipped",
+        f"   {len(known)} setting(s) already scored on the current base; "
+        "the same values on an older base are run again",
         flush=True,
     )
 
@@ -312,7 +321,7 @@ def _build_stack(args: argparse.Namespace) -> bool:
         target = len(chosen)
         print(
             f"   {category} has {distinct} coarse setting(s), "
-            f"{len(fresh)} not in history; stack uses {target}",
+            f"{len(fresh)} not scored on the current base; stack uses {target}",
             flush=True,
         )
         for params in chosen:
@@ -326,19 +335,12 @@ def _build_stack(args: argparse.Namespace) -> bool:
         print(f"   stack target={target}", flush=True)
     if target <= 0:
         print(
-            "   every setting in this experiment is already in history; "
-            "the agent will choose different parameters",
+            "   every setting in this experiment is already scored on the current base; "
+            "it runs again after another category changes that base",
             flush=True,
         )
         return False
 
-    best_rows = fetch_config_scores(
-        category=None,
-        scored_only=True,
-        limit=1,
-        order="avg_combined_final.desc",
-    )
-    base, best_row = best_base_updates(best_rows if best_rows else history)
     if best_row is None:
         print(f"   base config is the catalog default ({len(base)} parameters)", flush=True)
     else:
@@ -415,16 +417,21 @@ def _known_settings(
     study: Any,
     history: List[Dict[str, Any]],
     keys: List[str],
+    base: Dict[str, Any],
 ) -> Dict[tuple, tuple]:
-    """Settings already stored for these keys.
+    """Varied settings already scored on this base.
 
-    The value is (params, score). Score is None when the trial failed or is
-    still open. A row counts only when every key was part of that experiment,
-    so a held base value is not treated as a finished trial.
+    The value is (params, score). A past quality-filter value does not count
+    after assembly or priors change the other parameters: that is a new config.
+    A finished Optuna trial stores only the varied keys, so it cannot decide
+    this. Open trials still count, so the same stack is not queued twice.
     """
+    varied = set(keys)
     known: Dict[tuple, tuple] = {}
     cache: Dict[str, set] = {}
     for row in history:
+        if not _on_base(row, base, varied):
+            continue
         if not keys or not all(
             _row_informs_param(history, row, key, category_of(key), cache) for key in keys
         ):
@@ -434,20 +441,21 @@ def _known_settings(
             continue
         _remember_setting(known, params, _score_of(row))
     for trial in study.get_trials(deepcopy=False):
+        if getattr(trial.state, "name", "") not in ("RUNNING", "WAITING"):
+            continue
         raw = dict(getattr(trial, "params", None) or {})
         if not raw or any(key not in raw for key in keys):
             continue
-        params = {key: raw[key] for key in keys}
-        score = None
-        if getattr(trial.state, "name", "") == "COMPLETE":
-            try:
-                score = float(trial.value)
-            except (TypeError, ValueError):
-                score = None
-            if score is not None and not math.isfinite(score):
-                score = None
-        _remember_setting(known, params, score)
+        _remember_setting(known, {key: raw[key] for key in keys}, None)
     return known
+
+
+def _on_base(row: Dict[str, Any], base: Dict[str, Any], varied: set) -> bool:
+    """True when every parameter outside this experiment still matches the base."""
+    full = full_params_from_row(row)
+    held_row = {key: value for key, value in full.items() if key not in varied and spec_of(key)}
+    held_base = {key: value for key, value in base.items() if key not in varied and spec_of(key)}
+    return param_signature(held_row) == param_signature(held_base)
 
 
 def _remember_setting(
