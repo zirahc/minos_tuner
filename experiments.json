@@ -1,8 +1,8 @@
 {
   "experiments": [
     {
-      "name": "m5",
-      "hypothesis": "m5",
+      "name": "m11",
+      "hypothesis": "m11",
       "gatk_config": {
         "min_pruning": 2,
         "heterozygosity": 0.0005,
@@ -12,12 +12,12 @@
         "max_alternate_alleles": 11,
         "pruning_lod_threshold": 5.25,
         "min_base_quality_score": 10,
-        "assembly_region_padding": 500,
-        "max_assembly_region_size": 300,
+        "assembly_region_padding": 200,
+        "max_assembly_region_size": 325,
         "min_assembly_region_size": 51,
         "min_mapping_quality_score": 56,
         "min_dangling_branch_length": 2,
-        "active_probability_threshold": 0.001,
+        "active_probability_threshold": 0.01,
         "base_quality_score_threshold": 13,
         "max_reads_per_alignment_start": 125,
         "recover_all_dangling_branches": false,
@@ -29,8 +29,8 @@
         "standard_min_confidence_threshold_for_calling": 50
       },
       "space": {
-        "pcr_indel_model": {"type": "enum", "values": ["NONE", "HOSTILE", "AGGRESSIVE", "CONSERVATIVE"]},
-        "pair_hmm_gap_continuation_penalty": {"type": "int", "low": 1, "high": 30, "step": 1}
+        "assembly_region_padding": {"type": "int", "values": [300, 325, 350, 375, 400, 425, 450, 475, 500]},
+        "max_assembly_region_size": {"type": "int", "low": 300, "high": 700, "step": 25}
       }
     }
   ]
