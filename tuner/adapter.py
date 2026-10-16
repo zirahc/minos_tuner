@@ -320,8 +320,8 @@ def reconcile_categorical_study(
         return study
     for key, old, new in conflicts:
         print(
-            f"   {key} choices in {study_name} are {old}; catalog is {new}. "
-            "Rebuilding this study from scored history.",
+            f"   {key} in {study_name} was {old}; the continued study uses {new}. "
+            "Rebuilding the local study. Configs already scored are not run again.",
             flush=True,
         )
     return open_study(optuna, study_name, storage, reset=True)
@@ -352,9 +352,27 @@ def _distribution_conflicts(
             continue
         old_step = getattr(old, "step", None)
         new_step = getattr(dist, "step", None)
-        if old_step != new_step or bool(getattr(old, "log", False)) != bool(getattr(dist, "log", False)):
-            conflicts.append((key, old_step, new_step))
+        if (
+            old_step != new_step
+            or bool(getattr(old, "log", False)) != bool(getattr(dist, "log", False))
+            or _bound_differs(getattr(old, "low", None), getattr(dist, "low", None))
+            or _bound_differs(getattr(old, "high", None), getattr(dist, "high", None))
+        ):
+            conflicts.append((
+                key,
+                (getattr(old, "low", None), getattr(old, "high", None), old_step),
+                (getattr(dist, "low", None), getattr(dist, "high", None), new_step),
+            ))
     return conflicts
+
+
+def _bound_differs(old: Any, new: Any) -> bool:
+    if old is None or new is None:
+        return old != new
+    try:
+        return abs(float(old) - float(new)) > 1e-9
+    except (TypeError, ValueError):
+        return old != new
 
 
 def _has_open_trials(study: Any) -> bool:
