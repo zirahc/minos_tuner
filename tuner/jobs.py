@@ -14,6 +14,8 @@ CONFIG_TABLE = "gatk_configs"
 EVAL_TABLE = "gatk_evaluations"
 SCORE_VIEW = "gatk_config_scores"
 WORKER_TABLE = "gatk_workers"
+EXPERIMENT_TABLE = "experiments"
+TERMINAL_STATUS = ("scored", "failed")
 
 
 def config_table() -> str:
@@ -26,6 +28,10 @@ def eval_table() -> str:
 
 def score_view() -> str:
     return (os.environ.get("SUPABASE_SCORE_VIEW") or SCORE_VIEW).strip()
+
+
+def experiment_table() -> str:
+    return (os.environ.get("SUPABASE_EXPERIMENT_TABLE") or EXPERIMENT_TABLE).strip()
 
 
 def insert_pending_config(
@@ -52,6 +58,9 @@ def insert_pending_config(
         "optuna_trial_number": trial_number,
         "status": status,
     }
+    experiment_id = str(box.get("experiment_id") or "").strip()
+    if experiment_id:
+        row["experiment_id"] = experiment_id
     if worker_id:
         row["worker_id"] = str(worker_id)
     if batch_id:
@@ -81,6 +90,74 @@ def experiment_name_exists(name: str) -> Optional[bool]:
     if data is None:
         return None
     return isinstance(data, list) and bool(data)
+
+
+def list_experiments(experiment_id: str = "") -> Optional[List[Dict[str, Any]]]:
+    """Rows the fleet may run. One id returns that row even when it is done."""
+    params = ["select=*", "order=created_at.asc"]
+    label = str(experiment_id or "").strip()
+    if label:
+        params.append(f"id=eq.{urllib.parse.quote(label, safe='')}")
+    else:
+        params.append("status=in.(pending,running)")
+    data = rest_json("GET", experiment_table(), query="&".join(params))
+    if data is None:
+        return None
+    return data if isinstance(data, list) else []
+
+
+def set_experiment_status(experiment_id: str, status: str) -> bool:
+    quoted = urllib.parse.quote(str(experiment_id), safe="")
+    data = rest_json(
+        "PATCH",
+        experiment_table(),
+        query=f"id=eq.{quoted}",
+        body={
+            "status": status,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    return data is not None
+
+
+def experiment_configs(experiment_id: str) -> Optional[List[Dict[str, Any]]]:
+    quoted = urllib.parse.quote(str(experiment_id), safe="")
+    data = rest_json(
+        "GET",
+        config_table(),
+        query="&".join([
+            "select=id,status",
+            f"experiment_id=eq.{quoted}",
+        ]),
+    )
+    if data is None:
+        return None
+    return data if isinstance(data, list) else []
+
+
+def finish_experiments() -> Optional[List[str]]:
+    """Set status=done when every trial for a running experiment is finished."""
+    data = rest_json(
+        "GET",
+        experiment_table(),
+        query="select=id,name&status=eq.running&order=created_at.asc",
+    )
+    if data is None:
+        return None
+    finished: List[str] = []
+    for row in data if isinstance(data, list) else []:
+        experiment_id = str(row.get("id") or "")
+        configs = experiment_configs(experiment_id)
+        if configs is None:
+            return None
+        if not configs:
+            continue
+        if any(str(item.get("status") or "") not in TERMINAL_STATUS for item in configs):
+            continue
+        if not set_experiment_status(experiment_id, "done"):
+            return None
+        finished.append(f"{row.get('name')} {experiment_id}")
+    return finished
 
 
 def list_pending(limit: int = 1) -> List[Dict[str, Any]]:

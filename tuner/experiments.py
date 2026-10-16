@@ -39,6 +39,28 @@ def load_gatk_config(path: Path) -> Dict[str, Any]:
     return params
 
 
+def experiment_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """One experiments-table row, in the same shape as an experiments.json entry."""
+    payload: Dict[str, Any] = {
+        "name": row.get("name"),
+        "hypothesis": row.get("hypothesis") or "",
+    }
+    if row.get("search_category"):
+        payload["search_category"] = row.get("search_category")
+    space = row.get("space")
+    updates = row.get("updates")
+    if isinstance(space, dict) and space:
+        payload["space"] = space
+    if isinstance(updates, dict) and updates:
+        payload["updates"] = updates
+    item = _one(1, payload)
+    experiment_id = str(row.get("id") or "")
+    item["experiment_id"] = experiment_id
+    if item["kind"] == "screen":
+        item["box"]["experiment_id"] = experiment_id
+    return item
+
+
 def load_experiments(path: Path) -> List[Dict[str, Any]]:
     """Pending experiments. An empty or missing file means the agent chooses."""
     if not path.is_file():
@@ -153,7 +175,7 @@ def _screen_box(
     box["catalog_category"] = catalog
     if identity != catalog:
         box["pass_id"] = identity
-    box["suggested_by"] = "experiments.json"
+    box["suggested_by"] = "experiments"
     box["manual_name"] = name
     return box
 
@@ -172,7 +194,7 @@ def _experiment_space(name: str, catalog: str, space_in: Any) -> Dict[str, Any]:
         if key not in allowed:
             raise ValueError(f"{name}: {key} is not in {catalog}")
         if not isinstance(raw, dict):
-            raise ValueError(f"{name}: space.{key} must be an object with low, high, and step")
+            raise ValueError(f"{name}: space.{key} must be an object with type, low, high, and step")
         spec = allowed[key]
         if spec.kind == "categorical":
             raise ValueError(f"{name}: set {key} under updates. It is a choice, not a range.")
@@ -181,6 +203,11 @@ def _experiment_space(name: str, catalog: str, space_in: Any) -> Dict[str, Any]:
 
 
 def _range_item(name: str, key: str, spec: Any, raw: Dict[str, Any]) -> Dict[str, Any]:
+    kind = str(raw.get("type") or "").strip().lower()
+    if kind not in ("int", "float"):
+        raise ValueError(f"{name}: {key} needs a type of int or float")
+    if kind != spec.kind:
+        raise ValueError(f"{name}: {key} is {spec.kind} in the catalog, not {kind}")
     low = raw.get("low", spec.low)
     high = raw.get("high", spec.high)
     try:
@@ -194,13 +221,13 @@ def _range_item(name: str, key: str, spec: Any, raw: Dict[str, Any]) -> Dict[str
         raise ValueError(f"{name}: {key} high {high_f} is above {spec.high}")
     if low_f > high_f:
         raise ValueError(f"{name}: {key} low is above high")
-    if spec.kind == "int":
+    if kind == "int":
         low_v: Any = int(round(low_f))
         high_v: Any = int(round(high_f))
     else:
         low_v = low_f
         high_v = high_f
-    item: Dict[str, Any] = {"type": spec.kind, "low": low_v, "high": high_v}
+    item: Dict[str, Any] = {"type": kind, "low": low_v, "high": high_v}
     if "step" not in raw or raw.get("step") is None:
         raise ValueError(f"{name}: {key} needs a step")
     try:
@@ -209,9 +236,9 @@ def _range_item(name: str, key: str, spec: Any, raw: Dict[str, Any]) -> Dict[str
         raise ValueError(f"{name}: {key} step must be a number") from e
     if step <= 0:
         raise ValueError(f"{name}: {key} step must be greater than 0")
-    if spec.kind == "int" and step != int(step):
+    if kind == "int" and step != int(step):
         raise ValueError(f"{name}: {key} step must be a whole number")
-    item["step"] = int(step) if spec.kind == "int" else step
+    item["step"] = int(step) if kind == "int" else step
     return item
 
 

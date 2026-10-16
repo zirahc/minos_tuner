@@ -100,7 +100,41 @@ create index if not exists gatk_configs_study_idx
 create index if not exists gatk_configs_worker_status_idx
   on public.gatk_configs (worker_id, status);
 
+-- A GATK VPS posts one row when main.py is running. The fleet reads this
+-- list, so a new machine is used without editing TUNER_WORKERS or restarting.
+create table if not exists public.gatk_workers (
+  worker_id  text primary key,
+  last_seen  timestamptz not null default now(),
+  status     text not null default 'online'
+);
+
+grant select, insert, update on public.gatk_workers to anon, authenticated, service_role;
+
+-- One row per experiments.json entry. The fleet queues rows that are not done
+-- and writes this id onto each gatk_configs trial as experiment_id.
+create table if not exists public.experiments (
+  id               uuid primary key default gen_random_uuid(),
+  name             text not null unique,
+  hypothesis       text not null,
+  search_category  text,
+  space            jsonb,
+  updates          jsonb,
+  status           text not null default 'pending',
+  created_at       timestamptz not null default now(),
+  updated_at       timestamptz not null default now(),
+  constraint experiments_status_check check (status in ('pending', 'running', 'done'))
+);
+
+alter table public.gatk_configs
+  add column if not exists experiment_id uuid references public.experiments(id);
+
+create index if not exists experiments_status_idx
+  on public.experiments (status);
+create index if not exists gatk_configs_experiment_id_idx
+  on public.gatk_configs (experiment_id);
+
 -- One row per config: the number Optuna should maximize.
+-- experiment_id is last so a re-run can add it to the existing view.
 create or replace view public.gatk_config_scores as
 select
   c.id as config_id,
@@ -130,19 +164,11 @@ select
   c.batch_id,
   c.rounds_target,
   c.rounds_done,
-  c.rounds_offset
+  c.rounds_offset,
+  c.experiment_id
 from public.gatk_configs c
 left join public.gatk_evaluations e on e.config_id = c.id
 group by c.id;
 
 grant select on public.gatk_config_scores to anon, authenticated, service_role;
-
--- A GATK VPS posts one row when main.py is running. The fleet reads this
--- list, so a new machine is used without editing TUNER_WORKERS or restarting.
-create table if not exists public.gatk_workers (
-  worker_id  text primary key,
-  last_seen  timestamptz not null default now(),
-  status     text not null default 'online'
-);
-
-grant select, insert, update on public.gatk_workers to anon, authenticated, service_role;
+grant select, insert, update on public.experiments to anon, authenticated, service_role;

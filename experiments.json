@@ -4,14 +4,14 @@
       "name": "m1_min_base_quality_score_1",
       "hypothesis": "min_base_quality_score between 10 and 50.",
       "space": {
-        "min_base_quality_score": {"low": 10, "high": 50, "step": 1}
+        "min_base_quality_score": {"type": "int", "low": 10, "high": 50, "step": 1}
       }
     },
     {
       "name": "m2_min_base_quality_score_2",
       "hypothesis": "min_base_quality_score between 10 and 50.",
       "space": {
-        "min_base_quality_score": {"low": 10, "high": 50, "step": 1}
+        "min_base_quality_score": {"type": "int", "low": 10, "high": 50, "step": 1}
       }
     }
   ]

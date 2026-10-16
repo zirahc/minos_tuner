@@ -2,9 +2,8 @@
 
   python -m tuner.fleet
 
-experiments.json is checked first. Those experiments run before the agent.
-The agent chooses one category to vary when that list is empty or already
-scored. Each trial writes every catalog
+The experiments table is checked first. Pending and running rows run before
+the agent. Set EXPERIMENT_ID to run one row. Each trial writes every catalog
 parameter: the best scored config, with that category's new values on top.
 Each trial scores every practice round in the folder. Optuna is told
 when that score is in. A free VPS takes the next trial immediately.
@@ -45,17 +44,20 @@ from tuner.adapter import (
     remember_scores,
 )
 from tuner.agent import main as agent_main
-from tuner.experiments import load_experiments, load_gatk_config
+from tuner.experiments import experiment_from_row, load_gatk_config
 from tuner.jobs import (
     assign_queued,
     config_for_trial,
+    experiment_configs,
     fetch_score_row,
-    experiment_name_exists,
+    finish_experiments,
     insert_pending_config,
+    list_experiments,
     list_online_workers,
     list_open_jobs,
     list_queued,
     release_offline_job,
+    set_experiment_status,
 )
 from tuner.search_box import MAX_TRIALS, load_search_box, optuna_distributions
 from tuner.spaces import (
@@ -90,11 +92,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     print("   a machine that runs main.py is given the next trial", flush=True)
     print("   every trial scores every practice round in the folder", flush=True)
-    print("   experiments.json starts from gatk_config.json", flush=True)
-    if _agent_enabled():
-        print("   the agent runs after the file experiments, then again when the stack finishes", flush=True)
+    pinned = _experiment_id()
+    if pinned:
+        print(f"   EXPERIMENT_ID={pinned}; that row runs when it is not done", flush=True)
     else:
-        print("   AGENT is false; the agent is off and only experiments.json is queued", flush=True)
+        print("   remaining experiments run from the experiments table", flush=True)
+    print("   those trials start from gatk_config.json", flush=True)
+    if _agent_enabled() and not pinned:
+        print("   the agent runs after the remaining experiments are done", flush=True)
+    elif not _agent_enabled():
+        print("   AGENT is false; the agent is off", flush=True)
     print("   GATK VPS: set WORKER_ID and run python main.py", flush=True)
     print("   stop with Ctrl+C", flush=True)
     args.scored_categories = []
@@ -115,14 +122,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             time.sleep(60)
             continue
         if rc == 3:
-            if _agent_enabled():
+            if _agent_enabled() and not _experiment_id():
                 print(
                     "   no unscored settings on the current base — retrying in 60s",
                     flush=True,
                 )
             else:
                 print(
-                    "   experiments.json has nothing new to queue — retrying in 60s",
+                    "   no remaining experiments — retrying in 60s",
                     flush=True,
                 )
             time.sleep(60)
@@ -214,10 +221,15 @@ def run_once(args: argparse.Namespace) -> int:
             still[config_id] = job
         watching = still
         if not watching and not queued:
-            if _agent_enabled():
+            finished = finish_experiments()
+            if finished is None:
+                return 2
+            for label in finished:
+                print(f"   experiment {label} status=done", flush=True)
+            if _agent_enabled() and not _experiment_id():
                 print("   stack finished — agent will set the next trials", flush=True)
             else:
-                print("   stack finished — next cycle reads experiments.json", flush=True)
+                print("   stack finished — next cycle reads the experiments table", flush=True)
             return 0
         waiting = ",".join(str(job.get("worker_id")) for job in watching.values())
         if queued and not free:
@@ -240,13 +252,25 @@ def run_once(args: argparse.Namespace) -> int:
 
 
 def _build_stack(args: argparse.Namespace) -> Optional[bool]:
-    try:
-        listed = load_experiments(Path(args.experiments))
-    except ValueError as e:
-        print(f"ERROR: {e}", flush=True)
+    finished = finish_experiments()
+    if finished is None:
         return False
+    for label in finished:
+        print(f"   experiment {label} status=done", flush=True)
+    pinned = _experiment_id()
+    rows = list_experiments(pinned)
+    if rows is None:
+        return False
+    if pinned and not rows:
+        print(f"ERROR: EXPERIMENT_ID {pinned} was not found in experiments", flush=True)
+        return False
+    remaining = [row for row in rows if str(row.get("status") or "") != "done"]
+    if pinned:
+        print(f"   EXPERIMENT_ID={pinned}", flush=True)
+    else:
+        print(f"   remaining experiments={len(remaining)}", flush=True)
     file_base: Optional[Dict[str, Any]] = None
-    if listed:
+    if remaining:
         try:
             file_base = load_gatk_config(Path(args.gatk_config))
         except ValueError as e:
@@ -257,41 +281,33 @@ def _build_stack(args: argparse.Namespace) -> Optional[bool]:
             f"({len(file_base)} parameters)",
             flush=True,
         )
-    for item in listed:
+    for row in remaining:
+        try:
+            item = experiment_from_row(row)
+        except ValueError as e:
+            print(f"ERROR: {e}", flush=True)
+            return False
         print(
-            f"   file experiment {item['name']}: {item['hypothesis']}",
+            f"   experiment {item['name']} id={item['experiment_id']}: {item['hypothesis']}",
             flush=True,
         )
-        seen = experiment_name_exists(item["name"])
-        if seen is None:
-            print(f"ERROR: could not look up {item['name']} in gatk_configs", flush=True)
-            return False
-        if seen:
-            print(
-                f"   {item['name']} is already in gatk_configs; ignoring it",
-                flush=True,
-            )
-            continue
         if item["kind"] == "fixed":
             outcome = _enqueue_fixed(args, item, file_base)
         else:
             outcome = _enqueue_box(args, item["box"], base_override=file_base)
-        if outcome is True:
+        noted = _note_experiment(item, outcome)
+        if noted == "placed":
             return True
-        if outcome is False:
+        if noted == "error":
             return False
-        print(
-            f"   {item['name']} is already scored on the current base",
-            flush=True,
-        )
-    if not _agent_enabled():
-        print("   agent is off; tuning stays on experiments.json", flush=True)
+        if noted == "busy":
+            return None
+    if pinned or not _agent_enabled():
+        if pinned:
+            print(f"   experiment {pinned} is done", flush=True)
+        else:
+            print("   no remaining experiments", flush=True)
         return None
-    if listed:
-        print(
-            "   no new file experiment to run; asking the agent",
-            flush=True,
-        )
     skipped = [str(name) for name in (getattr(args, "scored_categories", None) or [])]
     while len(skipped) < 16:
         outcome = _enqueue_box(args, None, skipped)
@@ -362,8 +378,9 @@ def _enqueue_fixed(
     box = {
         "search_category": item["category"],
         "hypothesis": item["hypothesis"],
-        "suggested_by": "experiments.json",
+        "suggested_by": "experiments",
         "study_name": item["name"],
+        "experiment_id": item.get("experiment_id"),
     }
     config_id = insert_pending_config(
         experiment=item["name"],
@@ -375,7 +392,7 @@ def _enqueue_fixed(
     if not config_id:
         print(
             "   ERROR: could not insert job. Re-run gatk_tuning.sql so "
-            "worker_id and batch_id exist.",
+            "experiment_id, worker_id, and batch_id exist.",
             flush=True,
         )
         return False
@@ -619,7 +636,7 @@ def _enqueue_box(
         if not config_id:
             print(
                 "   ERROR: could not insert job. Re-run gatk_tuning.sql so "
-                "worker_id and batch_id exist.",
+                "experiment_id, worker_id, and batch_id exist.",
                 flush=True,
             )
             _tell_state(study, trial.number, TrialState.FAIL)
@@ -947,6 +964,38 @@ def _enumerate_settings(space: Dict[str, Any]) -> List[Dict[str, Any]]:
     return rows
 
 
+def _experiment_id() -> str:
+    return (os.environ.get("EXPERIMENT_ID") or "").strip()
+
+
+def _note_experiment(item: Dict[str, Any], outcome: Any) -> str:
+    """placed, busy, done, or error. done means this row should not run again."""
+    experiment_id = str(item.get("experiment_id") or "")
+    name = str(item.get("name") or experiment_id)
+    if outcome is True:
+        if experiment_id and not set_experiment_status(experiment_id, "running"):
+            print(f"ERROR: could not set {name} to running", flush=True)
+            return "error"
+        print(f"   {name} status=running", flush=True)
+        return "placed"
+    if outcome is False:
+        return "error"
+    configs = experiment_configs(experiment_id) if experiment_id else []
+    if configs is None:
+        return "error"
+    if configs and any(str(row.get("status") or "") not in TERMINAL for row in configs):
+        if not set_experiment_status(experiment_id, "running"):
+            print(f"ERROR: could not set {name} to running", flush=True)
+            return "error"
+        print(f"   {name} still has trials in progress", flush=True)
+        return "busy"
+    if experiment_id and not set_experiment_status(experiment_id, "done"):
+        print(f"ERROR: could not set {name} to done", flush=True)
+        return "error"
+    print(f"   {name} status=done", flush=True)
+    return "done"
+
+
 def _agent_enabled() -> bool:
     raw = (os.environ.get("AGENT") or "true").strip().lower()
     return raw not in ("0", "false", "no", "off")
@@ -958,7 +1007,7 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     p.add_argument(
         "--experiments",
         default=str(DEFAULT_EXPERIMENTS),
-        help="JSON list of experiments to run before the agent.",
+        help="Kept for compatibility. upload_experiments.py reads this file.",
     )
     p.add_argument(
         "--gatk-config",
