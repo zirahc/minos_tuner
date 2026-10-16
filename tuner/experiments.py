@@ -161,11 +161,19 @@ def _screen_box(
     hypothesis: str,
     space_in: Any = None,
 ) -> Dict[str, Any]:
-    catalog = catalog_name(category) or catalog_name(name)
-    if not catalog:
-        known = ", ".join(sorted(SPACES))
-        raise ValueError(f"{name}: unknown search_category {category!r}. known: {known}")
-    identity = _identity(name, category, catalog)
+    owners = _space_owners(name, space_in)
+    if len(owners) == 1:
+        catalog = owners[0]
+        identity = _identity(name, category, catalog)
+    elif len(owners) > 1:
+        catalog = ""
+        identity = name
+    else:
+        catalog = catalog_name(category) or catalog_name(name)
+        if not catalog:
+            known = ", ".join(sorted(SPACES))
+            raise ValueError(f"{name}: unknown search_category {category!r}. known: {known}")
+        identity = _identity(name, category, catalog)
     space = _experiment_space(name, catalog, space_in)
     if not space:
         raise ValueError(
@@ -173,7 +181,7 @@ def _screen_box(
             "Set that choice under updates."
         )
     box = validate_search_box({
-        "search_category": catalog,
+        "search_category": catalog or name,
         "hypothesis": hypothesis,
         "space": space,
         "constraints": {},
@@ -182,8 +190,8 @@ def _screen_box(
     })
     box["space"] = space
     box["n_trials"] = enough_trials(space)
-    box["search_category"] = identity
-    box["catalog_category"] = catalog
+    box["search_category"] = identity or name
+    box["catalog_category"] = catalog or name
     if identity != catalog:
         box["pass_id"] = identity
     box["suggested_by"] = "experiments"
@@ -192,32 +200,75 @@ def _screen_box(
     return box
 
 
+def _space_owners(name: str, space_in: Any) -> List[str]:
+    if not isinstance(space_in, dict):
+        return []
+    owners: List[str] = []
+    for key in space_in:
+        owner = category_of(str(key))
+        if owner is None:
+            raise ValueError(f"{name}: unknown parameter {key}")
+        if owner not in owners:
+            owners.append(owner)
+    return owners
+
+
 def _experiment_space(name: str, catalog: str, space_in: Any) -> Dict[str, Any]:
     """File ranges replace the catalog grid. Omitted space keeps the catalog steps."""
-    allowed = space_for(catalog)
     if not isinstance(space_in, dict) or not space_in:
+        if not catalog:
+            return {}
         return {
             key: spec
-            for key, spec in specs_to_space_json(allowed).items()
+            for key, spec in specs_to_space_json(space_for(catalog)).items()
             if not held_at_default(key)
         }
     out: Dict[str, Any] = {}
     for key, raw in space_in.items():
-        if key not in allowed:
-            raise ValueError(f"{name}: {key} is not in {catalog}")
+        spec = spec_of(str(key))
+        if spec is None:
+            raise ValueError(f"{name}: unknown parameter {key}")
+        owner = category_of(str(key))
+        if catalog and owner != catalog:
+            raise ValueError(f"{name}: {key} is in {owner}, not {catalog}")
         if not isinstance(raw, dict):
             raise ValueError(
                 f"{name}: space.{key} must be an object with type and values, "
                 "or type, low, high, and step"
             )
-        spec = allowed[key]
         if spec.kind == "categorical":
-            raise ValueError(f"{name}: set {key} under updates. It is a choice, not a range.")
-        if "values" in raw:
+            out[key] = _choice_list(name, key, spec, raw)
+        elif "values" in raw:
             out[key] = _value_list(name, key, spec, raw)
         else:
             out[key] = _range_item(name, key, spec, raw)
     return out
+
+
+def _choice_list(name: str, key: str, spec: Any, raw: Dict[str, Any]) -> Dict[str, Any]:
+    kind = str(raw.get("type") or "").strip().lower()
+    if kind == "enum":
+        kind = "categorical"
+    if kind != "categorical":
+        raise ValueError(f"{name}: {key} is a choice. Set type to enum and list values.")
+    raw_values = raw.get("values")
+    if not isinstance(raw_values, list) or not raw_values:
+        raise ValueError(f"{name}: {key} values must be a non-empty list")
+    allowed = list(spec.choices or ())
+    values: List[Any] = []
+    seen = set()
+    for item in raw_values:
+        try:
+            value = coerce_param(spec, item)
+        except ValueError as e:
+            raise ValueError(f"{name}: {key} value {item!r} is not one of {allowed}") from e
+        if value not in allowed:
+            raise ValueError(f"{name}: {key} value {value!r} is not one of {allowed}")
+        if value in seen:
+            raise ValueError(f"{name}: {key} value {value!r} is listed more than once")
+        seen.add(value)
+        values.append(value)
+    return {"type": "categorical", "values": values, "choices": values}
 
 
 def _value_list(name: str, key: str, spec: Any, raw: Dict[str, Any]) -> Dict[str, Any]:

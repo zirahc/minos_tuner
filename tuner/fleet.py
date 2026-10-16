@@ -460,14 +460,15 @@ def _enqueue_box(
             flush=True,
         )
         return None
-    box["space"] = {
-        key: spec for key, spec in box["space"].items() if not held_at_default(str(key))
-    }
+    manual = str(box.get("manual_name") or "").strip()
+    if not manual:
+        box["space"] = {
+            key: spec for key, spec in box["space"].items() if not held_at_default(str(key))
+        }
     if not box["space"]:
         print("   search box has no numeric parameters left to vary", flush=True)
         return False
     category = box["search_category"]
-    manual = str(box.get("manual_name") or "").strip()
     if manual:
         study_name = manual
     else:
