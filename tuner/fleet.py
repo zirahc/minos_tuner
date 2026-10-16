@@ -44,7 +44,7 @@ from tuner.adapter import (
     remember_scores,
 )
 from tuner.agent import main as agent_main
-from tuner.experiments import experiment_from_row, load_gatk_config
+from tuner.experiments import experiment_from_row
 from tuner.jobs import (
     assign_queued,
     config_for_trial,
@@ -97,7 +97,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"   EXPERIMENT_ID={pinned}; that row runs when it is not done", flush=True)
     else:
         print("   remaining experiments run from the experiments table", flush=True)
-    print("   those trials start from gatk_config.json", flush=True)
+    print("   each experiment sends its own gatk_config to the VPS", flush=True)
     if _agent_enabled() and not pinned:
         print("   the agent runs after the remaining experiments are done", flush=True)
     elif not _agent_enabled():
@@ -269,32 +269,29 @@ def _build_stack(args: argparse.Namespace) -> Optional[bool]:
         print(f"   EXPERIMENT_ID={pinned}", flush=True)
     else:
         print(f"   remaining experiments={len(remaining)}", flush=True)
-    file_base: Optional[Dict[str, Any]] = None
-    if remaining:
-        try:
-            file_base = load_gatk_config(Path(args.gatk_config))
-        except ValueError as e:
-            print(f"ERROR: {e}", flush=True)
-            return False
-        print(
-            f"   base config read from {Path(args.gatk_config).name} "
-            f"({len(file_base)} parameters)",
-            flush=True,
-        )
     for row in remaining:
         try:
             item = experiment_from_row(row)
         except ValueError as e:
             print(f"ERROR: {e}", flush=True)
             return False
+        base = item.get("gatk_config")
+        if not isinstance(base, dict) or not base:
+            print(f"ERROR: {item['name']} has no gatk_config", flush=True)
+            return False
         print(
             f"   experiment {item['name']} id={item['experiment_id']}: {item['hypothesis']}",
             flush=True,
         )
+        print(
+            f"   gatk_config from the experiment table ({len(base)} parameters) "
+            "is sent to the VPS",
+            flush=True,
+        )
         if item["kind"] == "fixed":
-            outcome = _enqueue_fixed(args, item, file_base)
+            outcome = _enqueue_fixed(args, item, base)
         else:
-            outcome = _enqueue_box(args, item["box"], base_override=file_base)
+            outcome = _enqueue_box(args, item["box"], base_override=base)
         noted = _note_experiment(item, outcome)
         if noted == "placed":
             return True
@@ -361,7 +358,7 @@ def _enqueue_fixed(
         return None
     if file_base is not None:
         print(
-            f"   base config is gatk_config.json ({len(base)} parameters). "
+            f"   base config is the experiment gatk_config ({len(base)} parameters). "
             f"{item['name']} sets {item['updates']}.",
             flush=True,
         )
@@ -400,17 +397,28 @@ def _enqueue_fixed(
     return True
 
 
-def _config_seen(rows: List[Dict[str, Any]], updates: Dict[str, Any]) -> bool:
-    """True when this full config is already scored or still in the stack."""
+def _config_match(rows: List[Dict[str, Any]], updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """A scored or in-flight row with the same parameter values, in any study."""
     wanted = param_signature({key: value for key, value in updates.items() if spec_of(key)})
+    waiting: Optional[Dict[str, Any]] = None
     for row in rows:
-        if _score_of(row) is None and str(row.get("status") or "") not in ("queued", "pending", "running"):
+        score = _score_of(row)
+        status = str(row.get("status") or "")
+        if score is None and status not in ("queued", "pending", "running"):
             continue
         full = full_params_from_row(row)
         current = param_signature({key: value for key, value in full.items() if spec_of(key)})
-        if current == wanted:
-            return True
-    return False
+        if current != wanted:
+            continue
+        if score is not None:
+            return row
+        waiting = waiting or row
+    return waiting
+
+
+def _config_seen(rows: List[Dict[str, Any]], updates: Dict[str, Any]) -> bool:
+    """True when this full config is already scored or still in the stack."""
+    return _config_match(rows, updates) is not None
 
 
 def _enqueue_box(
@@ -459,7 +467,11 @@ def _enqueue_box(
         print("   search box has no numeric parameters left to vary", flush=True)
         return False
     category = box["search_category"]
-    study_name = args.study or default_study_name(category)
+    manual = str(box.get("manual_name") or "").strip()
+    if manual:
+        study_name = manual
+    else:
+        study_name = args.study or default_study_name(category)
     box["study_name"] = study_name
     storage = (os.environ.get("OPTUNA_STORAGE") or DEFAULT_STORAGE).strip()
     distributions = catalog_categorical_distributions(
@@ -474,7 +486,10 @@ def _enqueue_box(
         return False
     history = [row for row in past if _score_of(row) is not None]
     space_keys = list(box["space"])
-    if is_agent_experiment(category):
+    if manual:
+        print(f"   study={study_name} belongs to this experiment", flush=True)
+        added, skipped = 0, 0
+    elif is_agent_experiment(category):
         print(
             f"   {category}: varying "
             + ", ".join(space_keys)
@@ -529,17 +544,41 @@ def _enqueue_box(
         if remembered:
             print(f"   remembered {remembered} scored setting(s) from history", flush=True)
             known = _known_settings(study, past, space_keys, base, pass_id)
-    scope = f" in {pass_id}" if pass_id else ""
-    print(
-        f"   {len(known)} setting(s) already scored on the current base{scope}; "
-        "the same values on an older base are run again",
-        flush=True,
-    )
+    if not manual:
+        scope = f" in {pass_id}" if pass_id else ""
+        print(
+            f"   {len(known)} setting(s) already scored on the current base{scope}; "
+            "the same values on an older base are run again",
+            flush=True,
+        )
 
     budget = max(1, min(MAX_TRIALS, int(box.get("n_trials") or 1)))
     distinct = _distinct_settings(box["space"])
     fresh: List[Dict[str, Any]] = []
-    if distinct is not None and distinct <= 100000:
+    if manual and distinct is not None and distinct <= 100000:
+        fresh = []
+        already = 0
+        for params in _enumerate_settings(box["space"]):
+            candidate = dict(base)
+            candidate.update(params)
+            if _config_match(past, candidate) is not None:
+                already += 1
+                continue
+            fresh.append(params)
+        chosen = _spread_settings(fresh, budget)
+        target = len(chosen)
+        print(
+            f"   {study_name} has {distinct} setting(s), "
+            f"{already} already scored with the same parameters; stack uses {target}",
+            flush=True,
+        )
+        for params in chosen:
+            try:
+                study.enqueue_trial(params)
+            except Exception as e:  # noqa: BLE001
+                print(f"   WARNING: could not enqueue {params}: {e}", flush=True)
+                break
+    elif distinct is not None and distinct <= 100000:
         fresh = [
             params for params in _enumerate_settings(box["space"])
             if param_signature(params) not in known
@@ -561,17 +600,23 @@ def _enqueue_box(
         target = budget
         print(f"   stack target={target}", flush=True)
     if target <= 0:
-        print(
-            "   every setting in this experiment is already scored on the current base; "
-            "it runs again after another category changes that base",
-            flush=True,
-        )
+        if manual:
+            print(
+                "   every setting in this experiment already has the same parameters",
+                flush=True,
+            )
+        else:
+            print(
+                "   every setting in this experiment is already scored on the current base; "
+                "it runs again after another category changes that base",
+                flush=True,
+            )
         return str(category)
 
     if base_override is not None:
         print(
-            f"   base config is gatk_config.json ({len(base)} parameters). "
-            f"This stack varies {category}; every other parameter stays in that file.",
+            f"   base config is the experiment gatk_config ({len(base)} parameters). "
+            f"This stack varies {category}; every other parameter is sent as stored.",
             flush=True,
         )
     elif best_row is None:
@@ -590,6 +635,7 @@ def _enqueue_box(
     placed = 0
     attempts = 0
     insert_failed = False
+    placed_full: set = set()
     while placed < target and attempts < target * 4:
         attempts += 1
         try:
@@ -603,7 +649,32 @@ def _enqueue_box(
             return False
         params = dict(trial.params)
         signature = param_signature(params)
-        if signature in known:
+        if manual:
+            updates = dict(base)
+            updates.update(params)
+            full_sig = param_signature(
+                {key: value for key, value in updates.items() if spec_of(key)}
+            )
+            match = _config_match(past, updates)
+            if match is not None or full_sig in placed_full:
+                score = _score_of(match) if match is not None else None
+                if score is not None:
+                    _tell_state(study, trial.number, None, score)
+                    print(
+                        f"   skip trial={trial.number} same parameters already scored "
+                        f"{score:.4f} study={match.get('study_name')}",
+                        flush=True,
+                    )
+                else:
+                    _tell_state(study, trial.number, TrialState.FAIL)
+                    where = (match or {}).get("study_name") or study_name
+                    print(
+                        f"   skip trial={trial.number} same parameters already in {where}",
+                        flush=True,
+                    )
+                continue
+            placed_full.add(full_sig)
+        elif signature in known:
             previous = known[signature][1]
             if previous is not None:
                 _tell_state(study, trial.number, None, previous)
@@ -616,9 +687,9 @@ def _enqueue_box(
                 print(f"   skip trial={trial.number} already tried {params}", flush=True)
             continue
         known[signature] = (params, None)
-        updates = dict(base)
-        updates.update(params)
-        manual = str(box.get("manual_name") or "").strip()
+        if not manual:
+            updates = dict(base)
+            updates.update(params)
         experiment = manual or f"optuna-{category}-t{trial.number}"
         print(
             f"   stack [{placed + 1}/{target}] trial={trial.number} "
@@ -891,6 +962,9 @@ def _fixed_choice_count(space: Dict[str, Any]) -> Optional[int]:
 def _grid_values(spec: Dict[str, Any]) -> Optional[List[Any]]:
     """Coarse values for one parameter. None when the range is still continuous."""
     kind = spec.get("type")
+    listed = spec.get("values")
+    if isinstance(listed, list) and listed:
+        return list(listed)
     choices = spec.get("choices")
     if kind == "categorical" or choices:
         values = list(choices or [])

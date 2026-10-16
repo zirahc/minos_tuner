@@ -17,6 +17,18 @@ from tuner.spaces import (
 )
 
 
+def parse_gatk_config(name: str, raw: Any) -> Dict[str, Any]:
+    """Held GATK parameters. Omitted keys stay at the catalog default."""
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError(f"{name}: gatk_config must be an object of GATK parameters")
+    params = catalog_defaults()
+    for key, value in raw.items():
+        if str(key) == "note":
+            continue
+        params[str(key)] = _exact_value(str(key), value)
+    return params
+
+
 def load_gatk_config(path: Path) -> Dict[str, Any]:
     """Base GATK parameters for experiments.json. Missing keys stay at the catalog default."""
     if not path.is_file():
@@ -29,14 +41,7 @@ def load_gatk_config(path: Path) -> Dict[str, Any]:
         raise ValueError(f"could not read {path.name}: {e}") from e
     if isinstance(raw, dict) and isinstance(raw.get("gatk_config"), dict):
         raw = raw["gatk_config"]
-    if not isinstance(raw, dict) or not raw:
-        raise ValueError(f"{path.name} must be an object of GATK parameters")
-    params = catalog_defaults()
-    for key, value in raw.items():
-        if str(key) == "note":
-            continue
-        params[str(key)] = _exact_value(str(key), value)
-    return params
+    return parse_gatk_config(path.name, raw)
 
 
 def experiment_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -53,6 +58,8 @@ def experiment_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
         payload["space"] = space
     if isinstance(updates, dict) and updates:
         payload["updates"] = updates
+    if isinstance(row.get("gatk_config"), dict):
+        payload["gatk_config"] = row.get("gatk_config")
     item = _one(1, payload)
     experiment_id = str(row.get("id") or "")
     item["experiment_id"] = experiment_id
@@ -92,6 +99,7 @@ def _one(index: int, item: Any) -> Dict[str, Any]:
     updates = item.get("updates")
     category = str(item.get("search_category") or "").strip()
     space_in = item.get("space")
+    gatk_config = parse_gatk_config(name, item.get("gatk_config"))
     if isinstance(updates, dict) and updates:
         if isinstance(space_in, dict) and space_in:
             raise ValueError(f"{name}: set updates or space, not both")
@@ -102,16 +110,19 @@ def _one(index: int, item: Any) -> Dict[str, Any]:
             "hypothesis": hypothesis,
             "category": category or _category_for(name, coerced),
             "updates": coerced,
+            "gatk_config": gatk_config,
         }
     if isinstance(space_in, dict) and space_in:
         category = category or _category_for(name, space_in)
     if category:
-        return {
+        parsed = {
             "kind": "screen",
             "name": name,
             "hypothesis": hypothesis,
             "box": _screen_box(name, category, hypothesis, space_in),
+            "gatk_config": gatk_config,
         }
+        return parsed
     raise ValueError(f"{name}: set updates, space, or search_category")
 
 
@@ -177,6 +188,7 @@ def _screen_box(
         box["pass_id"] = identity
     box["suggested_by"] = "experiments"
     box["manual_name"] = name
+    box["study_name"] = name
     return box
 
 
@@ -194,12 +206,53 @@ def _experiment_space(name: str, catalog: str, space_in: Any) -> Dict[str, Any]:
         if key not in allowed:
             raise ValueError(f"{name}: {key} is not in {catalog}")
         if not isinstance(raw, dict):
-            raise ValueError(f"{name}: space.{key} must be an object with type, low, high, and step")
+            raise ValueError(
+                f"{name}: space.{key} must be an object with type and values, "
+                "or type, low, high, and step"
+            )
         spec = allowed[key]
         if spec.kind == "categorical":
             raise ValueError(f"{name}: set {key} under updates. It is a choice, not a range.")
-        out[key] = _range_item(name, key, spec, raw)
+        if "values" in raw:
+            out[key] = _value_list(name, key, spec, raw)
+        else:
+            out[key] = _range_item(name, key, spec, raw)
     return out
+
+
+def _value_list(name: str, key: str, spec: Any, raw: Dict[str, Any]) -> Dict[str, Any]:
+    kind = str(raw.get("type") or "").strip().lower()
+    if kind not in ("int", "float"):
+        raise ValueError(f"{name}: {key} needs a type of int or float")
+    if kind != spec.kind:
+        raise ValueError(f"{name}: {key} is {spec.kind} in the catalog, not {kind}")
+    raw_values = raw.get("values")
+    if not isinstance(raw_values, list) or not raw_values:
+        raise ValueError(f"{name}: {key} values must be a non-empty list")
+    values: List[Any] = []
+    seen = set()
+    for item in raw_values:
+        try:
+            number = float(item)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"{name}: {key} value {item!r} is not a number") from e
+        if kind == "int" and number != int(number):
+            raise ValueError(f"{name}: {key} value {item!r} must be a whole number")
+        value: Any = int(number) if kind == "int" else number
+        if spec.low is not None and float(value) < float(spec.low):
+            raise ValueError(f"{name}: {key} value {value} is below {spec.low}")
+        if spec.high is not None and float(value) > float(spec.high):
+            raise ValueError(f"{name}: {key} value {value} is above {spec.high}")
+        if value in seen:
+            raise ValueError(f"{name}: {key} value {value} is listed more than once")
+        seen.add(value)
+        values.append(value)
+    return {
+        "type": kind,
+        "values": values,
+        "low": min(values),
+        "high": max(values),
+    }
 
 
 def _range_item(name: str, key: str, spec: Any, raw: Dict[str, Any]) -> Dict[str, Any]:

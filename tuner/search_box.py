@@ -119,6 +119,9 @@ def load_search_box(path: Path) -> Dict[str, Any]:
 
 def _param_trials(spec: Mapping[str, Any]) -> int:
     """Coarse settings for one parameter. Step 10 from 10 to 50 is 5, not 40."""
+    listed = spec.get("values")
+    if isinstance(listed, list) and listed:
+        return len(listed)
     choices = list(spec.get("choices") or [])
     if spec.get("type") == "categorical" or choices:
         return max(1, len(choices))
@@ -156,6 +159,10 @@ def optuna_distributions(space: Mapping[str, Any], optuna: Any) -> Dict[str, Any
     dists: Dict[str, Any] = {}
     for key, spec in space.items():
         kind = spec.get("type")
+        listed = spec.get("values")
+        if isinstance(listed, list) and listed and kind in ("int", "float"):
+            dists[key] = optuna.distributions.CategoricalDistribution(list(listed))
+            continue
         if kind == "int":
             low = int(spec["low"])
             high = int(spec["high"])

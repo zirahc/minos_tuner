@@ -86,6 +86,8 @@ def main(argv: list[str] | None = None) -> int:
             body["space"] = entry["space"]
         if isinstance(entry.get("updates"), dict):
             body["updates"] = entry["updates"]
+        if isinstance(entry.get("gatk_config"), dict):
+            body["gatk_config"] = entry["gatk_config"]
         inserted = rest_json("POST", experiment_table(), body=body)
         if not isinstance(inserted, list) or not inserted:
             print(f"ERROR: could not upload {name}", flush=True)

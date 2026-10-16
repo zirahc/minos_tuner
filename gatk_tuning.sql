@@ -119,6 +119,7 @@ create table if not exists public.experiments (
   search_category  text,
   space            jsonb,
   updates          jsonb,
+  gatk_config      jsonb not null default '{}'::jsonb,
   status           text not null default 'pending',
   created_at       timestamptz not null default now(),
   updated_at       timestamptz not null default now(),
@@ -127,6 +128,9 @@ create table if not exists public.experiments (
 
 alter table public.gatk_configs
   add column if not exists experiment_id uuid references public.experiments(id);
+
+alter table public.experiments
+  add column if not exists gatk_config jsonb not null default '{}'::jsonb;
 
 create index if not exists experiments_status_idx
   on public.experiments (status);
